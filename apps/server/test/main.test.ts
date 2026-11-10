@@ -1,5 +1,4 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -9,9 +8,8 @@ import { describe, expect, it } from "vitest";
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const serverEntry = resolve(repoRoot, "apps/server/dist/main.js");
 
-/** The server suite runs from source; `main.ts` needs the compiled entry, so build once when missing. */
+/** The server suite runs from source; `main.ts` needs a current compiled entry. */
 const ensureBuild = (): void => {
-  if (existsSync(serverEntry)) return;
   execFileSync(
     process.execPath,
     [resolve(repoRoot, "node_modules/typescript/bin/tsc"), "-b", resolve(repoRoot, "apps/server")],

@@ -657,7 +657,14 @@ describe("server", () => {
     });
     expect(second.status).toBe(200);
     expect(harness.acp.failWithheldPrompt()).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // The reader loop resumes the failing turn before it serves the next request, so this reply
+    // orders the late failure ahead of the assertions without a sleep.
+    harness.acp.sendRequest(950, "fs/read_text_file", { sessionId: detail.id, path: "marker.txt" });
+    await harness.acp.waitForFrame(
+      (frame) =>
+        frame["id"] === 950 && (frame["result"] !== undefined || frame["error"] !== undefined),
+      "the ordering marker",
+    );
 
     const current = await json<{ status: string; lastError?: string }>(
       await call(harness.handler, "GET", `/api/tasks/${detail.id}`),

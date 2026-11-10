@@ -542,6 +542,63 @@ describe("App", () => {
     expect(screen.queryByRole("dialog", { name: "New task" })).toBeNull();
   });
 
+  it("polls health on the timer", async () => {
+    vi.useFakeTimers();
+    try {
+      installFetch(baseRoutes);
+      render(<App />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      const healthCalls = (): number => calls.filter((call) => call.path === "/api/health").length;
+      expect(healthCalls()).toBe(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_100);
+      });
+      expect(healthCalls()).toBe(2);
+      // The 30 s clock interval also fires here; coverage is the assertion that polling continues.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(healthCalls()).toBeGreaterThanOrEqual(8);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renders no permission banner for a task without a pending permission", async () => {
+    const user = userEvent.setup();
+    installFetch(baseRoutes);
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /My task/ }));
+    await screen.findByRole("heading", { name: "My task" });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("opens settings from the disconnected empty state", async () => {
+    const user = userEvent.setup();
+    installFetch((call) =>
+      call.path === "/api/health"
+        ? { body: { ok: true, acp: { connected: false } } }
+        : baseRoutes(call),
+    );
+    render(<App />);
+    expect(await screen.findByText("Not connected to the agent")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Open settings" }));
+    expect(await screen.findByRole("dialog", { name: "Settings" })).toBeTruthy();
+  });
+
+  it("closes the settings dialog", async () => {
+    const user = userEvent.setup();
+    installFetch(baseRoutes);
+    render(<App />);
+    await screen.findByText("My task");
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    expect(await screen.findByRole("dialog", { name: "Settings" })).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
+  });
+
   it("shows an API error", async () => {
     const user = userEvent.setup();
     installFetch((call) => {

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchServerSentEvents, useChat } from "@tanstack/ai-react";
-import type { TaskSummary } from "@grok-build-web/task-model";
+import type { PendingPermission, TaskSummary } from "@grok-build-web/task-model";
 import {
   cancelTask,
   closeTask,
@@ -40,6 +40,30 @@ const useMobile = (): boolean => {
     return () => query.removeEventListener("change", update);
   }, []);
   return mobile;
+};
+
+const PermissionPrompt = ({
+  detail,
+  connected,
+  onDecide,
+}: {
+  readonly detail: TaskDetail;
+  readonly connected: boolean;
+  readonly onDecide: (
+    taskId: string,
+    permission: PendingPermission,
+    decision: PermissionDecision,
+  ) => void;
+}) => {
+  const permission = detail.pendingPermission;
+  if (permission === undefined) return null;
+  return (
+    <PermissionBanner
+      permission={permission}
+      disabled={!connected}
+      onDecide={(decision) => onDecide(detail.id, permission, decision)}
+    />
+  );
 };
 
 const ChatPanel = ({
@@ -231,15 +255,17 @@ export const App = () => {
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
   };
 
-  const handlePermission = (decision: PermissionDecision): void => {
-    const pending = detail?.pendingPermission;
-    if (selectedId === null || pending === undefined) return;
+  const handlePermission = (
+    taskId: string,
+    permission: PendingPermission,
+    decision: PermissionDecision,
+  ): void => {
     const body =
       decision === "cancel"
-        ? { requestId: pending.requestId, decision }
-        : { requestId: pending.requestId, optionId: decision.optionId };
-    respondPermission(selectedId, body)
-      .then(() => loadDetail(selectedId))
+        ? { requestId: permission.requestId, decision }
+        : { requestId: permission.requestId, optionId: decision.optionId };
+    respondPermission(taskId, body)
+      .then(() => loadDetail(taskId))
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
   };
 
@@ -346,12 +372,8 @@ export const App = () => {
                 void reloadTasks();
               }}
             />
-            {detail?.pendingPermission === undefined ? null : (
-              <PermissionBanner
-                permission={detail.pendingPermission}
-                disabled={!connected}
-                onDecide={handlePermission}
-              />
+            {detail === null ? null : (
+              <PermissionPrompt detail={detail} connected={connected} onDecide={handlePermission} />
             )}
             {detail === null ? (
               <p className="empty-note">Loading task…</p>
