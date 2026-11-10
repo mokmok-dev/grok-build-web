@@ -350,9 +350,7 @@ export const applyNotification = (
       return applyQueueChanged(task, notification, now);
     case "prompt_complete":
       return touched(task, now, { status: "idle", runningPromptId: undefined });
-    case "sessions_changed":
-      return task;
-    case "models_update":
+    default:
       return task;
   }
 };

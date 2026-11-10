@@ -81,6 +81,15 @@ describe("taskToUiMessages", () => {
     });
   });
 
+  it("keeps streamed arguments that differ from the input", () => {
+    const task = withMessages([
+      toolMessage({ input: { command: "ls" }, arguments: '{"command":"pwd"}' }),
+    ]);
+    expect(taskToUiMessages(task)[0]?.parts[0]).toMatchObject({
+      arguments: '{"command":"pwd"}',
+    });
+  });
+
   it("defaults arguments and output for a bare tool", () => {
     const task = withMessages([toolMessage({})]);
     expect(taskToUiMessages(task)[0]?.parts[0]).toEqual({
