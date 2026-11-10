@@ -2,17 +2,18 @@ import type { ServerNotification, SessionUpdate } from "@grok-build-web/acp-prot
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import {
-  appendUserMessage,
   applyNotification,
   applySessionChange,
   createTask,
   markClosed,
   markError,
-  markHydrated,
   markReady,
   mergeUsage,
   resolvePermission,
   setPendingPermission,
+  startPrompt,
+  finishPrompt,
+  toDetail,
   toSummary,
   type ChatMessage,
   type Task,
@@ -22,7 +23,6 @@ import {
 const task = (patch: Partial<Task> = {}): Task => ({
   ...createTask({ id: "s1", cwd: "/tmp", title: "T", model: "m", now: 1 }),
   status: "idle",
-  hydrated: true,
   ...patch,
 });
 
@@ -58,6 +58,8 @@ const textTool = (tool: Partial<ToolCall>): ChatMessage => ({
   ],
 });
 
+const permission = { requestId: "r", toolCallId: "t", title: "Run", options: [] };
+
 const lastMessage = (current: Task): ChatMessage => {
   const message = current.messages[current.messages.length - 1];
   if (message === undefined) throw new Error("no messages");
@@ -83,14 +85,22 @@ describe("createTask", () => {
       configOptions: [],
       queue: [],
       runningPromptId: undefined,
-      hydrated: false,
+      yolo: false,
     });
   });
 
-  it("keeps an explicit title and model", () => {
-    const created = createTask({ id: "s", cwd: "/tmp", title: "T", model: "m", now: 5 });
+  it("keeps an explicit title, model and yolo flag", () => {
+    const created = createTask({
+      id: "s",
+      cwd: "/tmp",
+      title: "T",
+      model: "m",
+      yolo: true,
+      now: 5,
+    });
     expect(created.title).toBe("T");
     expect(created.model).toBe("m");
+    expect(created.yolo).toBe(true);
   });
 });
 
@@ -98,7 +108,6 @@ describe("lifecycle", () => {
   it("marks a task ready", () => {
     const ready = markReady(task({ status: "starting" }), 7);
     expect(ready.status).toBe("idle");
-    expect(ready.hydrated).toBe(true);
     expect(ready.updatedAt).toBe(7);
   });
 
@@ -106,29 +115,40 @@ describe("lifecycle", () => {
     expect(markClosed(task(), 7)).toMatchObject({ status: "closed", updatedAt: 7 });
   });
 
-  it("marks a task errored", () => {
-    expect(markError(task(), "boom", 7)).toMatchObject({
+  it("marks a task errored and clears the running prompt", () => {
+    expect(markError(task({ runningPromptId: "p1" }), "boom", 7)).toMatchObject({
       status: "error",
       lastError: "boom",
+      runningPromptId: undefined,
       updatedAt: 7,
     });
   });
 
-  it("marks a task hydrated", () => {
-    expect(markHydrated(task({ hydrated: false }), 7).hydrated).toBe(true);
-  });
-
-  it("appends a user message and starts running", () => {
-    const next = appendUserMessage(task(), "hello", 7);
+  it("appends a user message and records the running prompt", () => {
+    const next = startPrompt(task(), "p1", "hello", 7);
     expect(next.status).toBe("running");
+    expect(next.runningPromptId).toBe("p1");
     expect(next.messages).toEqual([
       { id: "user-0", role: "user", createdAt: 7, parts: [{ type: "text", text: "hello" }] },
     ]);
     expect(next.updatedAt).toBe(7);
   });
 
+  it("finishes a prompt into idle or awaiting permission", () => {
+    expect(finishPrompt(task({ status: "running", runningPromptId: "p1" }), 8)).toMatchObject({
+      status: "idle",
+      runningPromptId: undefined,
+      updatedAt: 8,
+    });
+    expect(
+      finishPrompt(
+        task({ status: "running", runningPromptId: "p1", pendingPermission: permission }),
+        8,
+      ).status,
+    ).toBe("awaiting_permission");
+  });
+
   it("sets and clears a pending permission", () => {
-    const permission = { requestId: "r", toolCallId: "t", title: "Run", options: [] };
     const pending = setPendingPermission(task(), permission, 7);
     expect(pending.status).toBe("awaiting_permission");
     expect(pending.pendingPermission).toEqual(permission);
@@ -239,7 +259,7 @@ describe("text chunks", () => {
   it("opens a new assistant message after a user message", () => {
     const next = update(
       { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "a" } },
-      appendUserMessage(task(), "hi", 5),
+      startPrompt(task(), "p1", "hi", 5),
     );
     expect(next.messages.map((message) => message.id)).toEqual(["user-0", "assistant-1"]);
   });
@@ -553,9 +573,10 @@ describe("x.ai session notifications", () => {
         sessionId: "s1",
         update: { sessionUpdate: "turn_completed", usage: { totalTokens: 4 } },
       },
-      task({ status: "running" }),
+      task({ status: "running", runningPromptId: "p1" }),
     );
     expect(next.status).toBe("idle");
+    expect(next.runningPromptId).toBeUndefined();
     expect(next.usage).toEqual({ totalTokens: 4 });
     expect(next.updatedAt).toBe(10);
   });
@@ -768,33 +789,48 @@ describe("toSummary", () => {
       pendingPermission: undefined,
       usage: { totalTokens: 2 },
       lastError: "e",
+      yolo: false,
+    });
+  });
+
+  it("projects task detail state", () => {
+    const detailed = task({
+      messages: [assistant([{ type: "text", text: "a" }])],
+      plan: [{ content: "step", priority: "high", status: "pending" }],
+      availableCommands: ["one"],
+      configOptions: ["two"],
+      queue: [{ id: "q", kind: "prompt", text: "x" }],
+    });
+    expect(toDetail(detailed)).toMatchObject({
+      id: "s1",
+      messageCount: 1,
+      messages: detailed.messages,
+      plan: detailed.plan,
+      availableCommands: ["one"],
+      configOptions: ["two"],
+      queue: detailed.queue,
     });
   });
 });
 
 describe("properties", () => {
-  it("appending a chunk twice equals concatenating twice", () => {
+  it("keeps every streamed prefix and appends exactly the chunk", () => {
     fc.assert(
-      fc.property(fc.string(), fc.string(), (first, second) => {
+      fc.property(fc.array(fc.string(), { maxLength: 8 }), (chunks) => {
         let current = task();
-        for (const text of [first, second, second]) {
+        let previous = "";
+        for (const chunk of chunks) {
           current = update(
-            { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+            { sessionUpdate: "agent_message_chunk", content: { type: "text", text: chunk } },
             current,
           );
+          const part = lastMessage(current).parts[0];
+          if (part?.type !== "text") throw new Error("expected a text part");
+          expect(part.text.startsWith(previous)).toBe(true);
+          expect(part.text).toBe(previous + chunk);
+          previous = part.text;
         }
-        const onlyFirstTwice = task();
-        const doubled = update(
-          { sessionUpdate: "agent_message_chunk", content: { type: "text", text: first } },
-          update(
-            { sessionUpdate: "agent_message_chunk", content: { type: "text", text: first } },
-            onlyFirstTwice,
-          ),
-        );
-        expect(lastMessage(current).parts).toEqual([
-          { type: "text", text: first + second + second },
-        ]);
-        expect(lastMessage(doubled).parts).toEqual([{ type: "text", text: first + first }]);
+        expect(previous).toBe(chunks.join(""));
       }),
     );
   });

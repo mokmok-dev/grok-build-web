@@ -22,7 +22,7 @@ describe("NewTaskDialog", () => {
       cwd: "/work",
       prompt: "hello",
       model: undefined,
-      yolo: true,
+      yolo: false,
     });
   });
 
@@ -45,7 +45,7 @@ describe("NewTaskDialog", () => {
       cwd: "/work",
       prompt: undefined,
       model: "m2",
-      yolo: false,
+      yolo: true,
     });
     expect(screen.getByRole("option", { name: "Model One" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "m2" })).toBeTruthy();

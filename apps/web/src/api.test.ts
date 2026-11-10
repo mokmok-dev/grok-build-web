@@ -25,6 +25,10 @@ describe("relativeTime", () => {
     expect(relativeTime(0, 120_000)).toBe("2m ago");
     expect(relativeTime(0, 2 * 3_600_000)).toBe("2h ago");
     expect(relativeTime(0, 2 * 86_400_000)).toBe("2d ago");
+    expect(relativeTime(0, 60_000)).toBe("1m ago");
+    expect(relativeTime(0, 3_600_000)).toBe("1h ago");
+    expect(relativeTime(0, 86_400_000)).toBe("1d ago");
+    expect(relativeTime(0, 59_000)).toBe("59s ago");
     expect(relativeTime(10_000, 1_000)).toBe("0s ago");
   });
 });
@@ -63,6 +67,7 @@ describe("toInitialMessages", () => {
     updatedAt: 1,
     messageCount: messages.length,
     usage: {},
+    yolo: false,
     messages,
     plan: [],
     availableCommands: [],

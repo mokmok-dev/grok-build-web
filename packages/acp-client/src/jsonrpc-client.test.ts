@@ -1,13 +1,13 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { allocate, emptyCorrelation, size, take, takeAll } from "./jsonrpc-client.ts";
+import { allocate, emptyCorrelation, take, takeAll } from "./jsonrpc-client.ts";
 
 describe("correlation", () => {
   it("allocates sequential ids", () => {
     const [first, afterFirst] = allocate(emptyCorrelation<string>(), "a", "token-a");
     const [second, afterSecond] = allocate(afterFirst, "b", "token-b");
     expect([first, second]).toEqual([1, 2]);
-    expect(size(afterSecond)).toBe(2);
+    expect(afterSecond.entries.size).toBe(2);
     expect(afterSecond.entries.get(1)).toEqual({ method: "a", token: "token-a" });
     expect(afterSecond.entries.get(2)).toEqual({ method: "b", token: "token-b" });
   });
@@ -16,7 +16,7 @@ describe("correlation", () => {
     const [id, state] = allocate(emptyCorrelation<string>(), "a", "token");
     const [entry, next] = take(state, id);
     expect(entry).toEqual({ method: "a", token: "token" });
-    expect(size(next)).toBe(0);
+    expect(next.entries.size).toBe(0);
     expect(next.nextId).toBe(2);
   });
 
@@ -34,7 +34,7 @@ describe("correlation", () => {
       { method: "a", token: "one" },
       { method: "b", token: "two" },
     ]);
-    expect(size(next)).toBe(0);
+    expect(next.entries.size).toBe(0);
     expect(next.nextId).toBe(3);
   });
 

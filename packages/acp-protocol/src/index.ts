@@ -27,7 +27,6 @@ export {
   parseModelState,
   parsePromptResult,
   parseServerNotification,
-  parseSessionListResult,
   parseSessionNewResult,
   parseSessionUpdate,
   parseUsage,
@@ -42,10 +41,8 @@ export type {
   ServerNotification,
   SessionChange,
   SessionConfigOption,
-  SessionListResult,
   SessionNewResult,
   SessionNotificationUpdate,
-  SessionSummary,
   SessionUpdate,
   Usage,
 } from "./session.ts";
@@ -55,7 +52,6 @@ export {
   permissionCancelled,
   permissionSelected,
   readFileResponse,
-  terminalOutputResponse,
 } from "./client-methods.ts";
 export type {
   ClientRequest,

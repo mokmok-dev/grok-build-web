@@ -1,13 +1,13 @@
 import {
+  AcpError,
+  readTextFile,
   resolveAllowedPath,
   resolveCandidate,
-  readTextFile,
   writeTextFile,
 } from "@grok-build-web/acp-client";
 import { Context, Effect, Layer } from "effect";
 import { realpath } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { AcpError } from "@grok-build-web/acp-client";
 
 export interface FsBridgeShape {
   readonly read: (
@@ -26,9 +26,11 @@ export class FsBridge extends Context.Service<FsBridge, FsBridgeShape>()(
 export interface FsBridgeOptions {
   readonly allowedRoots: readonly string[];
   readonly readOnly: boolean;
+  readonly maxFileBytes: number;
 }
 
-const realpathOfExistingAncestor = async (path: string): Promise<string> => {
+/** Resolves every existing ancestor so a symlinked cwd or root compares as its target. */
+export const realpathOfExistingAncestor = async (path: string): Promise<string> => {
   let current = path;
   const tail: string[] = [];
   for (;;) {
@@ -48,7 +50,11 @@ export const makeFsBridge = (options: FsBridgeOptions): FsBridgeShape => {
     Effect.gen(function* () {
       const resolved = resolveCandidate(candidate, cwd);
       const real = yield* Effect.promise(() => realpathOfExistingAncestor(resolved));
-      const allowed = resolveAllowedPath(real, cwd, options.allowedRoots);
+      const realCwd = yield* Effect.promise(() => realpathOfExistingAncestor(cwd));
+      const realRoots = yield* Effect.promise(() =>
+        Promise.all(options.allowedRoots.map(realpathOfExistingAncestor)),
+      );
+      const allowed = resolveAllowedPath(real, realCwd, realRoots);
       if (allowed === undefined) {
         return yield* new AcpError({ message: `Path is outside the allowed roots: ${candidate}` });
       }
@@ -60,7 +66,7 @@ export const makeFsBridge = (options: FsBridgeOptions): FsBridgeShape => {
       Effect.gen(function* () {
         const target = yield* guard(cwd, path);
         return yield* Effect.tryPromise({
-          try: () => readTextFile(target, line, limit),
+          try: () => readTextFile(target, line, limit, { maxBytes: options.maxFileBytes }),
           catch: (cause) => new AcpError({ message: `Cannot read ${path}: ${String(cause)}` }),
         });
       }),
@@ -71,7 +77,7 @@ export const makeFsBridge = (options: FsBridgeOptions): FsBridgeShape => {
         }
         const target = yield* guard(cwd, path);
         yield* Effect.tryPromise({
-          try: () => writeTextFile(target, content),
+          try: () => writeTextFile(target, content, { maxBytes: options.maxFileBytes }),
           catch: (cause) => new AcpError({ message: `Cannot write ${path}: ${String(cause)}` }),
         });
       }),

@@ -38,5 +38,3 @@ export const takeAll = <S>(
   [...state.entries.values()],
   { nextId: state.nextId, entries: new Map() },
 ];
-
-export const size = <S>(state: Correlation<S>): number => state.entries.size;

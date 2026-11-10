@@ -12,6 +12,8 @@ import {
   type AgUiMapperState,
 } from "./ag-ui.ts";
 
+const runId = "run-1";
+
 const text = (value: string, messageId?: string): SessionUpdate => ({
   sessionUpdate: "agent_message_chunk",
   content: { type: "text", text: value },
@@ -40,7 +42,7 @@ const toolUpdate = (toolCallId: string, status: string, rawOutput?: unknown): Se
 });
 
 const eventsOf = (updates: readonly SessionUpdate[]): readonly AgUiEvent[] => {
-  let state = emptyAgUiState();
+  let state = emptyAgUiState(runId);
   const events: AgUiEvent[] = [];
   for (const update of updates) {
     const mapped = mapSessionUpdate(state, update);
@@ -53,27 +55,48 @@ const eventsOf = (updates: readonly SessionUpdate[]): readonly AgUiEvent[] => {
 
 const assertBalanced = (events: readonly AgUiEvent[]): void => {
   const depth = new Map<string, number>();
+  const started = new Set<string>();
+  const ended = new Set<string>();
+  const bump = (key: string, delta: number): void => {
+    const next = (depth.get(key) ?? 0) + delta;
+    expect(next).toBeGreaterThanOrEqual(0);
+    depth.set(key, next);
+  };
   for (const event of events) {
-    if (event.type === "TEXT_MESSAGE_START") {
-      depth.set(event.messageId, (depth.get(event.messageId) ?? 0) + 1);
-    }
-    if (event.type === "TEXT_MESSAGE_END") {
-      depth.set(event.messageId, (depth.get(event.messageId) ?? 0) - 1);
-    }
-    if (event.type === "REASONING_MESSAGE_START") {
-      depth.set(`r:${event.messageId}`, (depth.get(`r:${event.messageId}`) ?? 0) + 1);
-    }
-    if (event.type === "REASONING_MESSAGE_END") {
-      depth.set(`r:${event.messageId}`, (depth.get(`r:${event.messageId}`) ?? 0) - 1);
-    }
-    if (event.type === "TOOL_CALL_START") {
-      depth.set(`t:${event.toolCallId}`, (depth.get(`t:${event.toolCallId}`) ?? 0) + 1);
-    }
-    if (event.type === "TOOL_CALL_END") {
-      depth.set(`t:${event.toolCallId}`, (depth.get(`t:${event.toolCallId}`) ?? 0) - 1);
+    switch (event.type) {
+      case "TEXT_MESSAGE_START":
+        bump(`t:${event.messageId}`, 1);
+        started.add(`t:${event.messageId}`);
+        break;
+      case "TEXT_MESSAGE_END":
+        bump(`t:${event.messageId}`, -1);
+        ended.add(`t:${event.messageId}`);
+        break;
+      case "REASONING_MESSAGE_START":
+        bump(`r:${event.messageId}`, 1);
+        started.add(`r:${event.messageId}`);
+        break;
+      case "REASONING_MESSAGE_END":
+        bump(`r:${event.messageId}`, -1);
+        ended.add(`r:${event.messageId}`);
+        break;
+      case "TOOL_CALL_START":
+        bump(`c:${event.toolCallId}`, 1);
+        started.add(`c:${event.toolCallId}`);
+        break;
+      case "TOOL_CALL_END":
+        bump(`c:${event.toolCallId}`, -1);
+        ended.add(`c:${event.toolCallId}`);
+        break;
+      case "TOOL_CALL_RESULT":
+        expect(ended.has(`c:${event.toolCallId}`)).toBe(true);
+        break;
+      default:
+        break;
     }
   }
   for (const value of depth.values()) expect(value).toBe(0);
+  expect([...started].sort()).toEqual([...ended].sort());
 };
 
 describe("run events", () => {
@@ -97,27 +120,34 @@ describe("run events", () => {
 });
 
 describe("text chunks", () => {
-  it("opens a text message and appends deltas", () => {
-    const first = mapSessionUpdate(emptyAgUiState(), text("a"));
+  it("opens a run-scoped text message and appends deltas", () => {
+    const first = mapSessionUpdate(emptyAgUiState(runId), text("a"));
     expect(first.events).toEqual([
-      { type: "TEXT_MESSAGE_START", messageId: "assistant", role: "assistant" },
-      { type: "TEXT_MESSAGE_CONTENT", messageId: "assistant", delta: "a" },
+      { type: "TEXT_MESSAGE_START", messageId: `${runId}-text`, role: "assistant" },
+      { type: "TEXT_MESSAGE_CONTENT", messageId: `${runId}-text`, delta: "a" },
     ]);
     const second = mapSessionUpdate(first.state, text("b"));
     expect(second.events).toEqual([
-      { type: "TEXT_MESSAGE_CONTENT", messageId: "assistant", delta: "b" },
+      { type: "TEXT_MESSAGE_CONTENT", messageId: `${runId}-text`, delta: "b" },
     ]);
     expect(second.state).toEqual({ ...first.state });
   });
 
+  it("uses distinct fallback ids per run", () => {
+    const first = mapSessionUpdate(emptyAgUiState("run-a"), text("a"));
+    const second = mapSessionUpdate(emptyAgUiState("run-b"), text("b"));
+    expect(first.events[0]).toMatchObject({ messageId: "run-a-text" });
+    expect(second.events[0]).toMatchObject({ messageId: "run-b-text" });
+  });
+
   it("reuses the open message id when a chunk has none", () => {
-    const first = mapSessionUpdate(emptyAgUiState(), text("a", "m1"));
+    const first = mapSessionUpdate(emptyAgUiState(runId), text("a", "m1"));
     const second = mapSessionUpdate(first.state, text("b"));
     expect(second.events).toEqual([{ type: "TEXT_MESSAGE_CONTENT", messageId: "m1", delta: "b" }]);
   });
 
   it("closes the open message when the id changes", () => {
-    const first = mapSessionUpdate(emptyAgUiState(), text("a", "m1"));
+    const first = mapSessionUpdate(emptyAgUiState(runId), text("a", "m1"));
     const second = mapSessionUpdate(first.state, text("b", "m2"));
     expect(second.events).toEqual([
       { type: "TEXT_MESSAGE_END", messageId: "m1" },
@@ -128,19 +158,19 @@ describe("text chunks", () => {
 });
 
 describe("thought chunks", () => {
-  it("opens a reasoning message and appends deltas", () => {
-    const first = mapSessionUpdate(emptyAgUiState(), thought("a"));
+  it("opens a run-scoped reasoning message and appends deltas", () => {
+    const first = mapSessionUpdate(emptyAgUiState(runId), thought("a"));
     expect(first.events).toEqual([
-      { type: "REASONING_MESSAGE_START", messageId: "reasoning", role: "reasoning" },
-      { type: "REASONING_MESSAGE_CONTENT", messageId: "reasoning", delta: "a" },
+      { type: "REASONING_MESSAGE_START", messageId: `${runId}-reasoning`, role: "reasoning" },
+      { type: "REASONING_MESSAGE_CONTENT", messageId: `${runId}-reasoning`, delta: "a" },
     ]);
     expect(mapSessionUpdate(first.state, thought("b")).events).toEqual([
-      { type: "REASONING_MESSAGE_CONTENT", messageId: "reasoning", delta: "b" },
+      { type: "REASONING_MESSAGE_CONTENT", messageId: `${runId}-reasoning`, delta: "b" },
     ]);
   });
 
   it("uses and switches explicit reasoning ids", () => {
-    const first = mapSessionUpdate(emptyAgUiState(), thought("a", "r1"));
+    const first = mapSessionUpdate(emptyAgUiState(runId), thought("a", "r1"));
     expect(first.state.reasoningMessageId).toBe("r1");
     expect(mapSessionUpdate(first.state, thought("b")).state.reasoningMessageId).toBe("r1");
     expect(mapSessionUpdate(first.state, thought("b", "r2")).events).toEqual([
@@ -153,7 +183,10 @@ describe("thought chunks", () => {
 
 describe("tool calls", () => {
   it("starts a tool call with its arguments", () => {
-    const mapped = mapSessionUpdate(emptyAgUiState(), toolCall("t1", "shell", { command: "ls" }));
+    const mapped = mapSessionUpdate(
+      emptyAgUiState(runId),
+      toolCall("t1", "shell", { command: "ls" }),
+    );
     expect(mapped.events).toEqual([
       {
         type: "TOOL_CALL_START",
@@ -167,7 +200,7 @@ describe("tool calls", () => {
   });
 
   it("falls back to the title and empty input", () => {
-    expect(mapSessionUpdate(emptyAgUiState(), toolCall("t1")).events).toEqual([
+    expect(mapSessionUpdate(emptyAgUiState(runId), toolCall("t1")).events).toEqual([
       {
         type: "TOOL_CALL_START",
         toolCallId: "t1",
@@ -179,27 +212,27 @@ describe("tool calls", () => {
   });
 
   it("attaches the open text message as parent", () => {
-    const textState = mapSessionUpdate(emptyAgUiState(), text("a", "m1")).state;
+    const textState = mapSessionUpdate(emptyAgUiState(runId), text("a", "m1")).state;
     expect(mapSessionUpdate(textState, toolCall("t1", "shell")).events[0]).toMatchObject({
       parentMessageId: "m1",
     });
   });
 
-  it("does not restart an open tool call", () => {
-    const opened = mapSessionUpdate(emptyAgUiState(), toolCall("t1", "shell"));
-    expect(mapSessionUpdate(opened.state, toolCall("t1")).events).toEqual([
-      { type: "TOOL_CALL_ARGS", toolCallId: "t1", delta: "{}" },
-    ]);
+  it("treats a repeated tool call as a no-op", () => {
+    const opened = mapSessionUpdate(emptyAgUiState(runId), toolCall("t1", "shell"));
+    const repeated = mapSessionUpdate(opened.state, toolCall("t1"));
+    expect(repeated.events).toEqual([]);
+    expect(repeated.state).toBe(opened.state);
   });
 
-  it("closes a tool call with its result", () => {
-    const opened = mapSessionUpdate(emptyAgUiState(), toolCall("t1", "shell"));
+  it("closes a tool call with its run-scoped result", () => {
+    const opened = mapSessionUpdate(emptyAgUiState(runId), toolCall("t1", "shell"));
     const closed = mapSessionUpdate(opened.state, toolUpdate("t1", "completed", { ok: true }));
     expect(closed.events).toEqual([
       { type: "TOOL_CALL_END", toolCallId: "t1" },
       {
         type: "TOOL_CALL_RESULT",
-        messageId: "tool-t1",
+        messageId: `${runId}-tool-t1`,
         toolCallId: "t1",
         content: '{"ok":true}',
         role: "tool",
@@ -209,11 +242,11 @@ describe("tool calls", () => {
   });
 
   it("uses empty content for a result without output", () => {
-    const opened = mapSessionUpdate(emptyAgUiState(), toolCall("t1", "shell"));
+    const opened = mapSessionUpdate(emptyAgUiState(runId), toolCall("t1", "shell"));
     const closed = mapSessionUpdate(opened.state, toolUpdate("t1", "failed"));
     expect(closed.events[1]).toEqual({
       type: "TOOL_CALL_RESULT",
-      messageId: "tool-t1",
+      messageId: `${runId}-tool-t1`,
       toolCallId: "t1",
       content: "",
       role: "tool",
@@ -221,7 +254,7 @@ describe("tool calls", () => {
   });
 
   it("ignores updates for unknown tools and open statuses", () => {
-    const opened = mapSessionUpdate(emptyAgUiState(), toolCall("t1", "shell"));
+    const opened = mapSessionUpdate(emptyAgUiState(runId), toolCall("t1", "shell"));
     const unknown = mapSessionUpdate(opened.state, toolUpdate("tx", "completed"));
     expect(unknown.events).toEqual([]);
     const open = mapSessionUpdate(opened.state, toolUpdate("t1", "in_progress"));
@@ -232,7 +265,7 @@ describe("tool calls", () => {
 
 describe("finishTurn", () => {
   it("closes every open stream", () => {
-    let state: AgUiMapperState = emptyAgUiState();
+    let state: AgUiMapperState = emptyAgUiState(runId);
     for (const update of [
       text("a"),
       thought("b"),
@@ -242,22 +275,25 @@ describe("finishTurn", () => {
       state = mapSessionUpdate(state, update).state;
     }
     expect(finishTurn(state).events).toEqual([
-      { type: "TEXT_MESSAGE_END", messageId: "assistant" },
-      { type: "REASONING_MESSAGE_END", messageId: "reasoning" },
+      { type: "TEXT_MESSAGE_END", messageId: `${runId}-text` },
+      { type: "REASONING_MESSAGE_END", messageId: `${runId}-reasoning` },
       { type: "TOOL_CALL_END", toolCallId: "t1" },
       { type: "TOOL_CALL_END", toolCallId: "t2" },
     ]);
-    expect(finishTurn(state).state).toEqual(emptyAgUiState());
+    expect(finishTurn(state).state).toEqual(emptyAgUiState(runId));
   });
 
   it("emits nothing for an empty state", () => {
-    expect(finishTurn(emptyAgUiState())).toEqual({ state: emptyAgUiState(), events: [] });
+    expect(finishTurn(emptyAgUiState(runId))).toEqual({
+      state: emptyAgUiState(runId),
+      events: [],
+    });
   });
 });
 
 describe("ignored updates", () => {
   it("returns the same state", () => {
-    const state = emptyAgUiState();
+    const state = emptyAgUiState(runId);
     for (const update of [
       { sessionUpdate: "plan", entries: [] },
       { sessionUpdate: "session_info_update" },
@@ -271,7 +307,7 @@ describe("ignored updates", () => {
 });
 
 describe("properties", () => {
-  it("emits balanced start and end events for any update sequence", () => {
+  it("emits balanced start and end events and a result for every closed tool", () => {
     const updateArbitrary = fc.oneof(
       fc.record({
         kind: fc.constant("text" as const),

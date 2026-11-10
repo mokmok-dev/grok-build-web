@@ -1,4 +1,5 @@
 import type { PermissionOption } from "@grok-build-web/acp-protocol";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   allowedRoots,
@@ -45,8 +46,8 @@ describe("resolveCandidate", () => {
 });
 
 describe("allowedRoots", () => {
-  it("resolves the cwd and every extra root", () => {
-    expect(allowedRoots("/work", ["/tmp", "rel"])).toEqual(["/work", "/tmp", "/work/rel"]);
+  it("resolves the cwd and every extra root against the process cwd", () => {
+    expect(allowedRoots("/work", ["/tmp", "rel"])).toEqual(["/work", "/tmp", resolve("rel")]);
   });
 });
 
@@ -108,5 +109,7 @@ describe("truncateOutput", () => {
 
   it("keeps the tail beyond the limit", () => {
     expect(truncateOutput("abcdef", 3)).toEqual({ output: "def", truncated: true });
+    expect(truncateOutput("abc", 0)).toEqual({ output: "", truncated: true });
+    expect(truncateOutput("abc", -1)).toEqual({ output: "", truncated: true });
   });
 });

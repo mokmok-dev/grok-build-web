@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchServerSentEvents, useChat } from "@tanstack/ai-react";
 import type { TaskSummary } from "@grok-build-web/task-model";
 import {
   cancelTask,
   closeTask,
+  CONNECTION_LABELS,
+  connectionOf,
   createTask,
   fetchAgent,
   fetchHealth,
@@ -27,20 +29,17 @@ import { TaskHeader } from "./components/TaskHeader.tsx";
 import { TaskList } from "./components/TaskList.tsx";
 import { Transcript } from "./components/Transcript.tsx";
 
-type Connection = "connected" | "reconnecting" | "disconnected" | "not-configured";
-
-const connectionOf = (settings: Settings | null, health: Health | null): Connection => {
-  if (settings === null || !settings.hasSecret) return "not-configured";
-  if (health === null) return "disconnected";
-  if (health.acp.connected) return "connected";
-  return health.acp.lastError === undefined ? "disconnected" : "reconnecting";
-};
-
-const connectionLabel: Record<Connection, string> = {
-  connected: "Connected",
-  reconnecting: "Reconnecting",
-  disconnected: "Disconnected",
-  "not-configured": "Not configured",
+const useMobile = (): boolean => {
+  const [mobile, setMobile] = useState(false);
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const query = window.matchMedia("(max-width: 800px)");
+    const update = (): void => setMobile(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+  return mobile;
 };
 
 const ChatPanel = ({
@@ -106,6 +105,14 @@ export const App = () => {
   const [showSettings, setShowSettings] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const mobile = useMobile();
+
+  const selectedIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedId;
+  const loadedIdRef = useRef<string | null>(null);
+  const menuRef = useRef<HTMLButtonElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const mountedRef = useRef(false);
 
   const reloadTasks = useCallback(async () => {
     try {
@@ -157,39 +164,58 @@ export const App = () => {
     };
   }, [reloadTasks, reloadHealth]);
 
-  const selected = tasks.find((task) => task.id === selectedId);
+  const loadDetail = useCallback(async (id: string) => {
+    try {
+      const next = await fetchTask(id);
+      if (selectedIdRef.current === id) setDetail(next);
+    } catch (cause) {
+      if (selectedIdRef.current === id) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    }
+  }, []);
 
-  const reloadDetail = useCallback(async () => {
+  const selected = tasks.find((task) => task.id === selectedId);
+  const selectedUpdatedAt = selected?.updatedAt;
+
+  // One detail effect: reset on selection change, coalesce refetches triggered by list updates.
+  useEffect(() => {
     if (selectedId === null) {
+      loadedIdRef.current = null;
       setDetail(null);
       return;
     }
-    try {
-      setDetail(await fetchTask(selectedId));
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+    if (loadedIdRef.current !== selectedId) {
+      loadedIdRef.current = selectedId;
+      setDetail(null);
     }
-  }, [selectedId]);
+    const timer = setTimeout(() => {
+      void loadDetail(selectedId);
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [selectedId, selectedUpdatedAt, loadDetail]);
 
   useEffect(() => {
-    void reloadDetail();
-  }, [reloadDetail]);
+    if (!mobile) return;
+    if (!mountedRef.current) {
+      mountedRef.current = true;
+      return;
+    }
+    if (drawerOpen) sidebarRef.current?.focus();
+    else menuRef.current?.focus();
+  }, [drawerOpen, mobile]);
 
-  const selectedUpdatedAt = selected?.updatedAt;
-  useEffect(() => {
-    if (selectedId !== null) void reloadDetail();
-  }, [selectedUpdatedAt, selectedId, reloadDetail]);
-
-  const connection = connectionOf(settings, health);
+  const connection = connectionOf(health);
   const connected = connection === "connected";
 
   const handleCreate = (input: NewTaskInput): void => {
     setShowNewTask(false);
     createTask(input)
       .then((created) => {
+        setTasks((current) => [created, ...current.filter((task) => task.id !== created.id)]);
         setSelectedId(created.id);
         setDetail(created);
-        void reloadTasks();
+        loadedIdRef.current = created.id;
       })
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
   };
@@ -202,7 +228,7 @@ export const App = () => {
         ? { requestId: pending.requestId, decision }
         : { requestId: pending.requestId, optionId: decision.optionId };
     respondPermission(selectedId, body)
-      .then(() => reloadDetail())
+      .then(() => loadDetail(selectedId))
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
   };
 
@@ -219,25 +245,34 @@ export const App = () => {
   return (
     <div className="app">
       <button
+        ref={menuRef}
         type="button"
         className="menu-button"
         aria-label="Open task list"
+        aria-expanded={drawerOpen}
+        aria-controls="task-sidebar"
         onClick={() => setDrawerOpen(true)}
       >
         ☰
       </button>
 
-      <aside className={drawerOpen ? "sidebar open" : "sidebar"} aria-label="Tasks">
+      <aside
+        id="task-sidebar"
+        ref={sidebarRef}
+        className={drawerOpen ? "sidebar open" : "sidebar"}
+        aria-label="Tasks"
+        tabIndex={-1}
+        inert={mobile && !drawerOpen}
+      >
         <div className="sidebar-header">
           <span className={`connection connection-${connection}`}>
-            {connectionLabel[connection]}
+            {CONNECTION_LABELS[connection]}
           </span>
+          {settings !== null && !settings.hasSecret ? (
+            <span className="connection-hint">No ACP secret configured</span>
+          ) : null}
           <div className="sidebar-actions">
-            <button
-              type="button"
-              onClick={() => setShowNewTask(true)}
-              disabled={connection === "not-configured"}
-            >
+            <button type="button" onClick={() => setShowNewTask(true)} disabled={!connected}>
               New task
             </button>
             <button type="button" onClick={() => setShowSettings(true)}>
@@ -272,18 +307,16 @@ export const App = () => {
       <main className="main">
         {selected === undefined ? (
           <EmptyState
-            title={connection === "not-configured" ? "ACP is not configured" : "No task selected"}
+            title={connected ? "No task selected" : "Not connected to the agent"}
             body={
-              connection === "not-configured"
-                ? "Add the agent WebSocket URL and secret in Settings."
-                : "Pick a task from the list or create a new one."
+              connected
+                ? "Pick a task from the list or create a new one."
+                : "Start grok agent serve, or check the URL and secret in Settings."
             }
             action={
-              connection === "not-configured" ? (
-                <button type="button" onClick={() => setShowSettings(true)}>
-                  Open settings
-                </button>
-              ) : undefined
+              <button type="button" onClick={() => setShowSettings(true)}>
+                Open settings
+              </button>
             }
           />
         ) : (
@@ -292,13 +325,13 @@ export const App = () => {
               task={selected}
               connected={connected}
               onCancel={() => {
-                void cancelTask(selected.id).then(() => reloadDetail());
+                void cancelTask(selected.id).then(() => loadDetail(selected.id));
               }}
               onClose={() => {
                 void closeTask(selected.id).then(() => reloadTasks());
               }}
               onRefresh={() => {
-                void reloadDetail();
+                void loadDetail(selected.id);
                 void reloadTasks();
               }}
             />
@@ -316,7 +349,7 @@ export const App = () => {
                 key={detail.id}
                 detail={detail}
                 connected={connected}
-                onTurnFinished={reloadDetail}
+                onTurnFinished={() => loadDetail(detail.id)}
               />
             )}
           </>

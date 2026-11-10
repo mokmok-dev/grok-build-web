@@ -48,9 +48,10 @@ export interface AcpStatusInfo {
 export interface AcpClientConfig {
   readonly url: string;
   readonly secret?: string;
-  readonly requestTimeoutMs?: number;
   readonly backoff?: BackoffOptions;
 }
+
+const REQUEST_TIMEOUT_MS = 120_000;
 
 export interface IncomingRequest {
   readonly request: ClientRequest;
@@ -97,7 +98,6 @@ export const make = (
   Effect.gen(function* () {
     const urlRef = yield* Ref.make(connectionUrl(config.url, config.secret));
     const backoff = config.backoff ?? defaultBackoff;
-    const requestTimeoutMs = config.requestTimeoutMs ?? 120_000;
 
     const statusRef = yield* Ref.make<AcpStatusInfo>({ state: "disconnected", url: "" });
     const statusPub = yield* PubSub.unbounded<AcpStatusInfo>();
@@ -252,12 +252,14 @@ export const make = (
         yield* writer
           .write(encodeRequest(id, method, params))
           .pipe(Effect.mapError((cause) => new AcpError({ message: String(cause) })));
-        const awaited = Deferred.await(deferred);
-        const timeout = timeoutOverride ?? requestTimeoutMs;
+        // Drop the entry on every exit path - response, failure, timeout and interruption.
+        const awaited = Deferred.await(deferred).pipe(
+          Effect.ensuring(Ref.update(correlation, (state) => take(state, id)[1])),
+        );
+        const timeout = timeoutOverride ?? REQUEST_TIMEOUT_MS;
         if (timeout <= 0) return yield* awaited;
         const result = yield* Effect.timeoutOption(awaited, Duration.millis(timeout));
         if (Option.isNone(result)) {
-          yield* Ref.update(correlation, (state) => take(state, id)[1]);
           return yield* new AcpError({ message: `ACP request timed out: ${method}` });
         }
         return result.value;

@@ -184,16 +184,6 @@ export const readFileResponse = (content: string): { content: string } => ({ con
 
 export const emptyResponse = (): Record<string, never> => ({});
 
-export const terminalOutputResponse = (
-  output: string,
-  truncated: boolean,
-  exitStatus?: TerminalExitStatus,
-): { output: string; truncated: boolean; exitStatus?: TerminalExitStatus } => ({
-  output,
-  truncated,
-  exitStatus,
-});
-
 export const permissionSelected = (
   optionId: string,
 ): { outcome: { outcome: "selected"; optionId: string } } => ({

@@ -1,160 +1,223 @@
-import { spawn, type ChildProcess } from "node:child_process"
-import { readdirSync } from "node:fs"
-import { connect } from "node:net"
-import { setTimeout as delay } from "node:timers/promises"
-import { chromium, type Page } from "@playwright/test"
+import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, readdirSync } from "node:fs";
+import { createServer } from "node:net";
+import { dirname, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
+import { chromium, expect, type Page } from "@playwright/test";
 
-const agentUrl = "ws://127.0.0.1:2419/ws"
-
-// NixOS cannot run Playwright's generic Linux download; the flake provides a patched headless shell instead.
+// NixOS cannot run Playwright's generic Linux download; the flake provides a patched headless shell.
 const chromiumExecutable = (): string | undefined => {
-  const override = process.env["PLAYWRIGHT_CHROMIUM_EXECUTABLE"]
-  if (override !== undefined) return override
+  const override = process.env["PLAYWRIGHT_CHROMIUM_EXECUTABLE"];
+  if (override !== undefined) return override;
   try {
-    const entry = readdirSync("/nix/store").find((name) => name.endsWith("-playwright-chromium-headless-shell"))
-    if (entry === undefined) return undefined
-    return `/nix/store/${entry}/chrome-headless-shell-linux64/chrome-headless-shell`
+    const entry = readdirSync("/nix/store").find((name) =>
+      name.endsWith("-playwright-chromium-headless-shell"),
+    );
+    if (entry === undefined) return undefined;
+    return `/nix/store/${entry}/chrome-headless-shell-linux64/chrome-headless-shell`;
   } catch {
-    return undefined
+    return undefined;
   }
-}
-const apiPort = 3000
-const webUrl = "http://127.0.0.1:5173"
+};
 
-const reachable = (port: number): Promise<boolean> =>
-  new Promise((resolve) => {
-    const socket = connect({ port, host: "127.0.0.1" })
-    socket.once("connect", () => {
-      socket.destroy()
-      resolve(true)
-    })
-    socket.once("error", () => resolve(false))
-  })
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
-const waitForPort = async (port: number, timeoutMs: number): Promise<void> => {
-  const started = Date.now()
-  while (Date.now() - started < timeoutMs) {
-    if (await reachable(port)) return
-    await delay(200)
-  }
-  throw new Error(`port ${port} did not open`)
-}
+const freePort = (): Promise<number> =>
+  new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        server.close();
+        reject(new Error("no port"));
+        return;
+      }
+      const { port } = address;
+      server.close(() => resolve(port));
+    });
+  });
+
+const reachable = async (port: number): Promise<boolean> => {
+  const response = await fetch(`http://127.0.0.1:${port}/`).catch(() => undefined);
+  return response !== undefined;
+};
 
 const waitForHttp = async (url: string, timeoutMs: number): Promise<void> => {
-  const started = Date.now()
-  while (Date.now() - started < timeoutMs) {
+  const started = Date.now();
+  for (;;) {
     try {
-      const response = await fetch(url)
-      if (response.ok) return
+      const response = await fetch(url);
+      if (response.ok) return;
     } catch {
       // retry
     }
-    await delay(200)
+    if (Date.now() - started > timeoutMs) throw new Error(`${url} did not become ready`);
+    await delay(100);
   }
-  throw new Error(`${url} did not become ready`)
-}
+};
 
-const children: ChildProcess[] = []
+const children: ChildProcess[] = [];
 
-const start = (command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): ChildProcess => {
+const start = (
+  command: string,
+  args: string[],
+  options: { readonly cwd?: string; readonly env?: NodeJS.ProcessEnv } = {},
+): ChildProcess => {
   const child = spawn(command, args, {
     cwd: options.cwd,
     env: { ...process.env, ...options.env },
     stdio: ["ignore", "pipe", "pipe"],
-  })
-  child.stdout?.on("data", (chunk: Buffer) => process.stdout.write(`[${command}] ${chunk.toString()}`))
-  child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[${command}] ${chunk.toString()}`))
-  children.push(child)
-  return child
-}
+    detached: true,
+  });
+  child.stdout?.on("data", (chunk: Buffer) => process.stdout.write(`[${command}] ${chunk}`));
+  child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[${command}] ${chunk}`));
+  children.push(child);
+  return child;
+};
 
-const stopAll = (): void => {
-  for (const child of children.splice(0)) {
-    child.kill("SIGTERM")
+const stopAll = async (): Promise<void> => {
+  const pending = children.splice(0);
+  for (const child of pending) {
+    if (child.pid === undefined) continue;
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
   }
-}
+  await Promise.all(
+    pending.map(
+      (child) =>
+        new Promise<void>((resolve) => {
+          if (child.exitCode !== null || child.signalCode !== null) {
+            resolve();
+            return;
+          }
+          child.once("exit", () => resolve());
+          setTimeout(resolve, 5_000);
+        }),
+    ),
+  );
+};
+
+const errors: string[] = [];
+
+const watch = (page: Page): void => {
+  page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(`console: ${message.text()}`);
+  });
+};
 
 const run = async (): Promise<void> => {
-  if (!(await reachable(2419))) {
-    console.log("starting grok agent serve")
-    start("grok", ["agent", "--always-approve", "serve", "--bind", "127.0.0.1:2419", "--secret", "testsecret"])
-    await waitForPort(2419, 30_000)
+  const agentPort = await freePort();
+  const apiPort = await freePort();
+  const webPort = await freePort();
+  const agentUrl = `ws://127.0.0.1:${agentPort}/ws`;
+  const apiUrl = `http://127.0.0.1:${apiPort}`;
+  const webUrl = `http://127.0.0.1:${webPort}`;
+
+  console.log(`ports: agent=${agentPort} api=${apiPort} web=${webPort}`);
+  start("grok", ["agent", "--always-approve", "serve", "--bind", `127.0.0.1:${agentPort}`, "--secret", "testsecret"]);
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    if (await reachable(agentPort)) break;
+    await delay(200);
   }
 
-  if (!(await reachable(apiPort))) {
-    console.log("starting grok-build-web server")
-    start("node", ["apps/server/dist/main.js"], {
-      env: {
-        GROK_ACP_URL: agentUrl,
-        GROK_ACP_SECRET: "testsecret",
-        PORT: String(apiPort),
-        GROK_WEB_DEFAULT_CWD: "/tmp",
-      },
-    })
-    await waitForHttp(`http://127.0.0.1:${apiPort}/api/health`, 30_000)
+  const serverEntry = resolve(repoRoot, "apps/server/dist/main.js");
+  if (!existsSync(serverEntry)) {
+    throw new Error(`${serverEntry} is missing; run pnpm build first`);
   }
+  start("node", [serverEntry], {
+    env: {
+      GROK_ACP_URL: agentUrl,
+      GROK_ACP_SECRET: "testsecret",
+      PORT: String(apiPort),
+      GROK_WEB_DEFAULT_CWD: "/tmp",
+    },
+  });
+  await waitForHttp(`${apiUrl}/api/health`, 30_000);
 
-  if (!(await reachable(5173))) {
-    console.log("starting vite dev server")
-    start("pnpm", ["--filter", "@grok-build-web/web", "exec", "vite", "--port", "5173", "--strictPort"], {
-      cwd: process.cwd(),
-    })
-    await waitForHttp(webUrl, 60_000)
-  }
+  start(resolve(repoRoot, "apps/web/node_modules/.bin/vite"), [
+    "--port",
+    String(webPort),
+    "--strictPort",
+  ], {
+    cwd: resolve(repoRoot, "apps/web"),
+    env: { GROK_WEB_API_URL: apiUrl },
+  });
+  await waitForHttp(webUrl, 60_000);
 
-  const browser = await chromium.launch({ executablePath: chromiumExecutable() })
-  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-  const page: Page = await context.newPage()
-  const logs: string[] = []
-  page.on("console", (message) => logs.push(`${message.type()}: ${message.text()}`))
-  page.on("pageerror", (error) => logs.push(`pageerror: ${error.message}`))
-
+  const browser = await chromium.launch({ executablePath: chromiumExecutable() });
   try {
-    await page.goto(webUrl, { waitUntil: "domcontentloaded" })
-    await page.getByText("Connected").waitFor({ timeout: 30_000 })
-    console.log("connection status: Connected")
+    const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const page = await context.newPage();
+    watch(page);
 
-    await page.getByRole("button", { name: "New task" }).click()
-    await page.getByLabel("Working directory").fill("/tmp")
-    await page.getByLabel("First prompt").fill("Reply with the single word: pong")
-    await page.getByRole("button", { name: "Create task" }).click()
+    await page.goto(webUrl, { waitUntil: "domcontentloaded" });
+    await expect(page.locator(".connection-connected")).toHaveText("Connected", {
+      timeout: 30_000,
+    });
+    console.log("connection status: Connected");
 
-    await page.getByText("pong", { exact: true }).waitFor({ timeout: 120_000 })
-    console.log("streamed assistant text: pong")
+    await page.getByRole("button", { name: "New task" }).click();
+    await page.getByLabel("Working directory").fill("/tmp");
+    await page.getByLabel("First prompt").fill("Reply with the single word: pong");
+    await page.getByRole("button", { name: "Create task" }).click();
 
-    await page.locator(".task-header [data-testid=status-badge]").getByText("Idle").waitFor({ timeout: 60_000 })
-    console.log("final status: Idle")
+    await expect(page.getByText(/^pong$/i).first()).toBeVisible({ timeout: 120_000 });
+    console.log("streamed assistant text: pong");
 
-    await page.screenshot({ path: "/tmp/grok-web-e2e-desktop.png", fullPage: true })
-    console.log("screenshot: /tmp/grok-web-e2e-desktop.png")
+    const badge = page.locator(".task-header [data-testid=status-badge]");
+    await expect(badge).toContainText("Idle", { timeout: 60_000 });
+    console.log("final status: Idle");
 
-    await page.setViewportSize({ width: 390, height: 844 })
-    await page.getByRole("button", { name: "Open task list" }).click()
-    const drawer = page.locator(".sidebar.open")
-    await drawer.waitFor({ timeout: 10_000 })
-    await page.waitForTimeout(400)
-    const box = await drawer.boundingBox()
-    if (box === null || Math.abs(box.x) > 1) throw new Error(`drawer did not slide into view: x=${box?.x}`)
-    console.log("mobile drawer opened")
-    await page.screenshot({ path: "/tmp/grok-web-e2e-mobile.png", fullPage: false })
-    console.log("screenshot: /tmp/grok-web-e2e-mobile.png")
+    const taskUrl = page.url();
+    await page.screenshot({ path: "/tmp/grok-web-e2e-desktop.png", fullPage: true });
+    console.log("screenshot: /tmp/grok-web-e2e-desktop.png");
 
-    await page.setViewportSize({ width: 1280, height: 900 })
-    await page.getByRole("button", { name: "Send" }).waitFor({ state: "visible" })
-    console.log("composer visible on desktop")
-    console.log(`console messages: ${logs.length}`)
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.getByRole("button", { name: "Open task list" }).click();
+    const drawer = page.locator(".sidebar.open");
+    await expect(drawer).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole("button", { name: "Open task list" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    await page.screenshot({ path: "/tmp/grok-web-e2e-mobile.png", fullPage: false });
+    console.log("screenshot: /tmp/grok-web-e2e-mobile.png");
+
+    // Clean up the session created by this run.
+    const tasks = (await (await fetch(`${apiUrl}/api/tasks`)).json()) as {
+      tasks: Array<{ id: string; status: string }>;
+    };
+    for (const task of tasks.tasks) {
+      if (task.status !== "closed") {
+        await fetch(`${apiUrl}/api/tasks/${task.id}/close`, { method: "POST" });
+      }
+    }
+    console.log(`closed ${tasks.tasks.length} session(s) at ${taskUrl}`);
+
+    await context.close();
   } finally {
-    await browser.close()
+    await browser.close();
   }
-}
+
+  if (errors.length > 0) {
+    throw new Error(`browser errors: ${errors.join("; ")}`);
+  }
+  console.log("no page errors");
+};
 
 run()
-  .then(() => {
-    stopAll()
-    process.exit(0)
+  .then(async () => {
+    await stopAll();
+    process.exit(0);
   })
-  .catch((error: unknown) => {
-    console.error(error)
-    stopAll()
-    process.exit(1)
-  })
+  .catch(async (error: unknown) => {
+    console.error(error);
+    await stopAll();
+    process.exit(1);
+  });

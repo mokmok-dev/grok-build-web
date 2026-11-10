@@ -1,5 +1,5 @@
 import type { ServerNotification } from "@grok-build-web/acp-protocol";
-import type { AcpClientShape } from "@grok-build-web/acp-client";
+import { AcpError, type AcpClientShape } from "@grok-build-web/acp-client";
 import {
   emptyAgUiState,
   errorRun,
@@ -8,8 +8,9 @@ import {
   mapSessionUpdate,
   startRun,
   type AgUiEvent,
+  type AgUiMapperState,
 } from "@grok-build-web/task-model";
-import { Effect, Fiber, Queue, Ref, Scope, Stream } from "effect";
+import { Cause, Effect, Fiber, Queue, Ref, Scope, Stream } from "effect";
 import type { TaskRegistryShape } from "./tasks.ts";
 
 export interface ChatInput {
@@ -19,6 +20,11 @@ export interface ChatInput {
 }
 
 const encoder = new TextEncoder();
+
+const messageOf = (cause: Cause.Cause<AcpError>): string => {
+  const error = Cause.squash(cause);
+  return error instanceof AcpError ? error.message : String(error);
+};
 
 export const sseFrame = (payload: unknown): Uint8Array =>
   encoder.encode(`data: ${JSON.stringify(payload)}\n\n`);
@@ -31,17 +37,21 @@ export const chatSse = (
 ): Effect.Effect<Stream.Stream<Uint8Array>, never, Scope.Scope> =>
   Effect.gen(function* () {
     const queue = yield* Queue.unbounded<AgUiEvent>();
-
-    const stateRef = yield* Ref.make(emptyAgUiState());
+    const stateRef = yield* Ref.make<AgUiMapperState>(emptyAgUiState(input.runId));
 
     const forward = (notification: ServerNotification) =>
       Effect.gen(function* () {
         if (notification.kind !== "session_update") return;
-        const state = yield* Ref.get(stateRef);
-        const mapped = mapSessionUpdate(state, notification.update);
+        const mapped = mapSessionUpdate(yield* Ref.get(stateRef), notification.update);
         yield* Ref.set(stateRef, mapped.state);
         for (const event of mapped.events) yield* Queue.offer(queue, event);
       });
+
+    const closeOpenStreams = Effect.gen(function* () {
+      const finished = finishTurn(yield* Ref.get(stateRef));
+      yield* Ref.set(stateRef, finished.state);
+      for (const event of finished.events) yield* Queue.offer(queue, event);
+    });
 
     const turn = Effect.gen(function* () {
       yield* Queue.offer(queue, startRun(input.threadId, input.runId));
@@ -56,11 +66,15 @@ export const chatSse = (
       );
       const result = yield* registry.promptAndWait(sessionId, input.text);
       yield* Fiber.interrupt(subscription);
-      const finished = finishTurn(yield* Ref.get(stateRef));
-      for (const event of finished.events) yield* Queue.offer(queue, event);
+      yield* closeOpenStreams;
       yield* Queue.offer(queue, finishRun(input.threadId, input.runId, result.usage));
     }).pipe(
-      Effect.catchTag("AcpError", (error) => Queue.offer(queue, errorRun(error.message))),
+      Effect.catchCause((cause) =>
+        Effect.gen(function* () {
+          yield* closeOpenStreams;
+          yield* Queue.offer(queue, errorRun(messageOf(cause)));
+        }),
+      ),
       Effect.onInterrupt(() => registry.cancel(sessionId).pipe(Effect.ignore)),
     );
 

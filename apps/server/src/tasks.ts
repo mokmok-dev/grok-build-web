@@ -12,21 +12,22 @@ import {
   type IncomingRequest,
 } from "@grok-build-web/acp-client";
 import {
-  appendUserMessage,
   applyNotification,
   applySessionChange,
   createTask,
+  finishPrompt,
   markClosed,
   markError,
-  markHydrated,
   markReady,
   resolvePermission,
   setPendingPermission,
+  startPrompt,
   toSummary,
   type Task,
   type TaskSummary,
 } from "@grok-build-web/task-model";
 import { Context, Effect, Layer, PubSub, Ref, Scope, Stream } from "effect";
+import { randomUUID } from "node:crypto";
 
 export interface CreateTaskInput {
   readonly cwd: string;
@@ -35,12 +36,17 @@ export interface CreateTaskInput {
   readonly yolo: boolean;
 }
 
+export interface TaskRegistryOptions {
+  readonly maxTasks: number;
+  readonly promptTimeoutMs: number;
+  readonly permissionTimeoutMs: number;
+}
+
 export interface TaskRegistryShape {
   readonly list: Effect.Effect<readonly TaskSummary[]>;
   readonly changes: Stream.Stream<readonly TaskSummary[]>;
   readonly get: (id: string) => Effect.Effect<Task | undefined>;
   readonly create: (input: CreateTaskInput) => Effect.Effect<Task, AcpError>;
-  readonly hydrate: (id: string) => Effect.Effect<Task | undefined, AcpError>;
   readonly prompt: (id: string, text: string) => Effect.Effect<void, AcpError>;
   readonly promptAndWait: (id: string, text: string) => Effect.Effect<PromptResult, AcpError>;
   readonly cancel: (id: string) => Effect.Effect<void, AcpError>;
@@ -61,17 +67,29 @@ interface PendingPermissionEntry {
   readonly incoming: IncomingRequest;
 }
 
-const permissionTimeout = "5 minutes";
-
 const now = (): number => Date.now();
 
-export const makeTaskRegistry: Effect.Effect<TaskRegistryShape, never, AcpClient | Scope.Scope> =
+/** Only these fields change the task list; streaming chunks update the task but not the snapshot. */
+const projection = (task: Task): string =>
+  JSON.stringify({
+    status: task.status,
+    title: task.title,
+    model: task.model,
+    messageCount: task.messages.length,
+    usage: task.usage,
+    lastError: task.lastError,
+    pendingPermission: task.pendingPermission,
+    yolo: task.yolo,
+  });
+
+export const makeTaskRegistry = (
+  options: TaskRegistryOptions,
+): Effect.Effect<TaskRegistryShape, never, AcpClient | Scope.Scope> =>
   Effect.gen(function* () {
     const client = yield* AcpClient;
     const tasksRef = yield* Ref.make<ReadonlyMap<string, Task>>(new Map());
-    const yoloRef = yield* Ref.make<ReadonlySet<string>>(new Set());
     const pendingRef = yield* Ref.make<ReadonlyMap<string, PendingPermissionEntry>>(new Map());
-    const changesPub = yield* PubSub.unbounded<readonly TaskSummary[]>();
+    const changesPub = yield* PubSub.sliding<readonly TaskSummary[]>(32);
 
     const summarize = (tasks: ReadonlyMap<string, Task>): readonly TaskSummary[] =>
       [...tasks.values()].sort((left, right) => right.updatedAt - left.updatedAt).map(toSummary);
@@ -82,8 +100,11 @@ export const makeTaskRegistry: Effect.Effect<TaskRegistryShape, never, AcpClient
 
     const put = (task: Task) =>
       Effect.gen(function* () {
+        const previous = (yield* Ref.get(tasksRef)).get(task.id);
         yield* Ref.update(tasksRef, (tasks) => new Map(tasks).set(task.id, task));
-        yield* publish;
+        if (previous === undefined || projection(previous) !== projection(task)) {
+          yield* publish;
+        }
       });
 
     const update = (id: string, change: (task: Task) => Task) =>
@@ -118,10 +139,7 @@ export const makeTaskRegistry: Effect.Effect<TaskRegistryShape, never, AcpClient
           yield* incoming.reply(permissionCancelled());
           return;
         }
-        const auto = autoSelectOption(
-          request.options,
-          (yield* Ref.get(yoloRef)).has(request.sessionId),
-        );
+        const auto = autoSelectOption(request.options, task.yolo);
         if (auto !== undefined) {
           yield* incoming.reply(permissionSelected(auto));
           return;
@@ -144,22 +162,37 @@ export const makeTaskRegistry: Effect.Effect<TaskRegistryShape, never, AcpClient
         );
         yield* Effect.forkScoped(
           Effect.gen(function* () {
-            yield* Effect.sleep(permissionTimeout);
-            const pending = yield* Ref.get(pendingRef);
-            if (!pending.has(requestId)) return;
-            yield* Ref.update(pendingRef, (entries) => {
-              const next = new Map(entries);
+            yield* Effect.sleep(options.permissionTimeoutMs);
+            const taken = yield* Ref.modify(pendingRef, (pending) => {
+              const entry = pending.get(requestId);
+              if (entry === undefined) return [undefined, pending];
+              const next = new Map(pending);
               next.delete(requestId);
-              return next;
+              return [entry, next];
             });
+            if (taken === undefined) return;
             yield* incoming.reply(permissionCancelled());
             yield* update(task.id, (current) => resolvePermission(current, now()));
           }),
         );
       });
 
-    yield* Effect.forkScoped(client.notifications.pipe(Stream.runForEach(handleNotification)));
-    yield* Effect.forkScoped(client.incomingRequests.pipe(Stream.runForEach(handlePermission)));
+    yield* Effect.forkScoped(
+      client.incomingRequests.pipe(
+        Stream.runForEach((incoming) =>
+          handlePermission(incoming).pipe(Effect.catchCause(() => Effect.void)),
+        ),
+      ),
+      { startImmediately: true },
+    );
+    yield* Effect.forkScoped(
+      client.notifications.pipe(
+        Stream.runForEach((notification) =>
+          handleNotification(notification).pipe(Effect.catchCause(() => Effect.void)),
+        ),
+      ),
+      { startImmediately: true },
+    );
     yield* Effect.forkScoped(
       client.statusChanges.pipe(
         Stream.runForEach((status) =>
@@ -177,34 +210,65 @@ export const makeTaskRegistry: Effect.Effect<TaskRegistryShape, never, AcpClient
             : Effect.void,
         ),
       ),
+      { startImmediately: true },
     );
 
-    const sendPrompt = (id: string, text: string) =>
-      client.request("session/prompt", { sessionId: id, prompt: [{ type: "text", text }] }, 0);
-
-    const appendUser = (id: string, text: string) =>
-      update(id, (task) => appendUserMessage(task, text, now()));
-
-    const promptAndWait = (id: string, text: string) =>
+    const beginPrompt = (id: string, text: string) =>
       Effect.gen(function* () {
-        yield* appendUser(id, text);
-        return parsePromptResult(yield* sendPrompt(id, text));
+        const task = (yield* Ref.get(tasksRef)).get(id);
+        if (task === undefined) return yield* new AcpError({ message: "Unknown task" });
+        if (task.status === "closed") {
+          return yield* new AcpError({ message: "Cannot prompt a closed task" });
+        }
+        if (task.runningPromptId !== undefined) {
+          return yield* new AcpError({ message: "A prompt is already running for this task" });
+        }
+        yield* put(startPrompt(task, randomUUID(), text, now()));
       });
+
+    const runTurn = <A>(
+      id: string,
+      effect: Effect.Effect<A, AcpError>,
+    ): Effect.Effect<A, AcpError> =>
+      effect.pipe(
+        Effect.matchEffect({
+          onFailure: (error) =>
+            Effect.gen(function* () {
+              yield* update(id, (task) => markError(task, error.message, now()));
+              return yield* Effect.fail(error);
+            }),
+          onSuccess: (value) =>
+            update(id, (task) => finishPrompt(task, now())).pipe(Effect.as(value)),
+        }),
+      );
+
+    const sendPrompt = (id: string, text: string) =>
+      runTurn(
+        id,
+        client.request(
+          "session/prompt",
+          { sessionId: id, prompt: [{ type: "text", text }] },
+          options.promptTimeoutMs,
+        ),
+      );
 
     const prompt = (id: string, text: string) =>
       Effect.gen(function* () {
-        yield* appendUser(id, text);
-        yield* Effect.forkDetach(
-          sendPrompt(id, text).pipe(
-            Effect.catchTag("AcpError", (error) =>
-              update(id, (task) => markError(task, error.message, now())),
-            ),
-          ),
-        );
+        yield* beginPrompt(id, text);
+        yield* Effect.forkDetach(sendPrompt(id, text).pipe(Effect.ignoreCause));
+      });
+
+    const promptAndWait = (id: string, text: string) =>
+      Effect.gen(function* () {
+        yield* beginPrompt(id, text);
+        return parsePromptResult(yield* sendPrompt(id, text));
       });
 
     const create = (input: CreateTaskInput) =>
       Effect.gen(function* () {
+        if ((yield* Ref.get(tasksRef)).size >= options.maxTasks) {
+          return yield* new AcpError({ message: `Task limit reached (${options.maxTasks})` });
+        }
         const result = yield* client.request("session/new", {
           cwd: input.cwd,
           mcpServers: [],
@@ -223,30 +287,21 @@ export const makeTaskRegistry: Effect.Effect<TaskRegistryShape, never, AcpClient
           });
         }
         const task = markReady(
-          createTask({ id: session.sessionId, cwd: input.cwd, model, now: now() }),
+          createTask({
+            id: session.sessionId,
+            cwd: input.cwd,
+            model,
+            yolo: input.yolo,
+            now: now(),
+          }),
           now(),
         );
         yield* put(task);
-        if (input.yolo) {
-          yield* Ref.update(yoloRef, (sessions) => new Set(sessions).add(session.sessionId));
-        }
         if (input.prompt !== undefined) {
           yield* prompt(session.sessionId, input.prompt);
           return (yield* Ref.get(tasksRef)).get(session.sessionId) ?? task;
         }
         return task;
-      });
-
-    const hydrate = (id: string) =>
-      Effect.gen(function* () {
-        const task = (yield* Ref.get(tasksRef)).get(id);
-        if (task === undefined) return undefined;
-        if (task.hydrated) return task;
-        yield* client.request("session/load", { sessionId: id, cwd: task.cwd, mcpServers: [] });
-        // Replayed updates arrive on the notification fiber, so let it drain before marking the task hydrated.
-        yield* Effect.sleep("100 millis");
-        yield* update(id, (current) => markHydrated(current, now()));
-        return (yield* Ref.get(tasksRef)).get(id);
       });
 
     const cancel = (id: string) => client.notify("session/cancel", { sessionId: id });
@@ -263,16 +318,17 @@ export const makeTaskRegistry: Effect.Effect<TaskRegistryShape, never, AcpClient
       decision: { readonly optionId: string } | "cancel",
     ) =>
       Effect.gen(function* () {
-        const entry = (yield* Ref.get(pendingRef)).get(requestId);
-        if (entry === undefined || entry.taskId !== id) {
-          return yield* new AcpError({ message: "Unknown permission request" });
-        }
-        yield* Ref.update(pendingRef, (pending) => {
+        const taken = yield* Ref.modify(pendingRef, (pending) => {
+          const entry = pending.get(requestId);
+          if (entry === undefined) return [undefined, pending];
           const next = new Map(pending);
           next.delete(requestId);
-          return next;
+          return [entry, next];
         });
-        yield* entry.incoming.reply(
+        if (taken === undefined || taken.taskId !== id) {
+          return yield* new AcpError({ message: "Unknown permission request" });
+        }
+        yield* taken.incoming.reply(
           decision === "cancel" ? permissionCancelled() : permissionSelected(decision.optionId),
         );
         yield* update(id, (task) => resolvePermission(task, now()));
@@ -283,7 +339,6 @@ export const makeTaskRegistry: Effect.Effect<TaskRegistryShape, never, AcpClient
       changes: Stream.fromPubSub(changesPub),
       get: (id) => Effect.map(Ref.get(tasksRef), (tasks) => tasks.get(id)),
       create,
-      hydrate,
       prompt,
       promptAndWait,
       cancel,
@@ -292,7 +347,7 @@ export const makeTaskRegistry: Effect.Effect<TaskRegistryShape, never, AcpClient
     };
   });
 
-export const taskRegistryLayer: Layer.Layer<TaskRegistry, never, AcpClient> = Layer.effect(
-  TaskRegistry,
-  makeTaskRegistry,
-);
+export const taskRegistryLayer = (
+  options: TaskRegistryOptions,
+): Layer.Layer<TaskRegistry, never, AcpClient> =>
+  Layer.effect(TaskRegistry, makeTaskRegistry(options));

@@ -3,17 +3,21 @@ import {
   mayCreateTerminal,
   startTerminal,
   type TerminalHandle,
+  type TerminalOptions,
 } from "@grok-build-web/acp-client";
-import type { TerminalOptions } from "@grok-build-web/acp-client";
 import { Context, Effect, Layer, Ref, Scope } from "effect";
 
 export interface TerminalRegistryShape {
   readonly create: (
+    sessionId: string,
     options: Omit<TerminalOptions, "outputByteLimit">,
   ) => Effect.Effect<string, AcpError>;
-  readonly get: (id: string) => Effect.Effect<TerminalHandle | undefined>;
-  readonly release: (id: string) => Effect.Effect<void>;
-  readonly kill: (id: string) => Effect.Effect<void>;
+  readonly get: (
+    sessionId: string,
+    terminalId: string,
+  ) => Effect.Effect<TerminalHandle | undefined>;
+  readonly release: (sessionId: string, terminalId: string) => Effect.Effect<void>;
+  readonly kill: (sessionId: string, terminalId: string) => Effect.Effect<void>;
   readonly shutdown: Effect.Effect<void>;
 }
 
@@ -27,6 +31,8 @@ export interface TerminalRegistryOptions {
   readonly outputByteLimit: number;
 }
 
+const keyOf = (sessionId: string, terminalId: string): string => `${sessionId}\u0000${terminalId}`;
+
 export const makeTerminalRegistry = (
   options: TerminalRegistryOptions,
 ): Effect.Effect<TerminalRegistryShape, never, Scope.Scope> =>
@@ -34,19 +40,17 @@ export const makeTerminalRegistry = (
     const terminalsRef = yield* Ref.make<ReadonlyMap<string, TerminalHandle>>(new Map());
     const counterRef = yield* Ref.make(0);
 
-    const remove = (id: string) =>
-      Effect.gen(function* () {
-        const handle = (yield* Ref.get(terminalsRef)).get(id);
-        if (handle === undefined) return undefined;
-        yield* Ref.update(terminalsRef, (terminals) => {
-          const next = new Map(terminals);
-          next.delete(id);
-          return next;
-        });
-        return handle;
+    const remove = (sessionId: string, terminalId: string) =>
+      Ref.modify(terminalsRef, (terminals) => {
+        const key = keyOf(sessionId, terminalId);
+        const handle = terminals.get(key);
+        if (handle === undefined) return [undefined, terminals];
+        const next = new Map(terminals);
+        next.delete(key);
+        return [handle, next];
       });
 
-    const create = (terminalOptions: Omit<TerminalOptions, "outputByteLimit">) =>
+    const create = (sessionId: string, terminalOptions: Omit<TerminalOptions, "outputByteLimit">) =>
       Effect.gen(function* () {
         const open = (yield* Ref.get(terminalsRef)).size;
         if (!mayCreateTerminal(options.readOnly, open, options.maxTerminals)) {
@@ -56,24 +60,28 @@ export const makeTerminalRegistry = (
               : "Terminal limit reached",
           });
         }
-        const id = `terminal-${yield* Ref.updateAndGet(counterRef, (value) => value + 1)}`;
-        const handle = startTerminal({
-          ...terminalOptions,
-          outputByteLimit: options.outputByteLimit,
+        const terminalId = `terminal-${yield* Ref.updateAndGet(counterRef, (value) => value + 1)}`;
+        const handle = yield* Effect.try({
+          try: () =>
+            startTerminal({ ...terminalOptions, outputByteLimit: options.outputByteLimit }),
+          catch: (cause) =>
+            new AcpError({ message: `Cannot start ${terminalOptions.command}: ${String(cause)}` }),
         });
-        yield* Ref.update(terminalsRef, (terminals) => new Map(terminals).set(id, handle));
-        return id;
+        yield* Ref.update(terminalsRef, (terminals) =>
+          new Map(terminals).set(keyOf(sessionId, terminalId), handle),
+        );
+        return terminalId;
       });
 
-    const release = (id: string) =>
+    const release = (sessionId: string, terminalId: string) =>
       Effect.gen(function* () {
-        const handle = yield* remove(id);
+        const handle = yield* remove(sessionId, terminalId);
         if (handle !== undefined) handle.release();
       });
 
-    const kill = (id: string) =>
+    const kill = (sessionId: string, terminalId: string) =>
       Effect.gen(function* () {
-        const handle = (yield* Ref.get(terminalsRef)).get(id);
+        const handle = (yield* Ref.get(terminalsRef)).get(keyOf(sessionId, terminalId));
         if (handle !== undefined) handle.kill();
       });
 
@@ -84,7 +92,10 @@ export const makeTerminalRegistry = (
 
     return {
       create,
-      get: (id) => Effect.map(Ref.get(terminalsRef), (terminals) => terminals.get(id)),
+      get: (sessionId, terminalId) =>
+        Effect.map(Ref.get(terminalsRef), (terminals) =>
+          terminals.get(keyOf(sessionId, terminalId)),
+        ),
       release,
       kill,
       shutdown,

@@ -17,23 +17,34 @@ export const appLayer = (
   );
   const core = Layer.mergeAll(
     acp,
-    fsBridgeLayer({ allowedRoots: config.allowedRoots, readOnly: config.readOnly }),
+    fsBridgeLayer({
+      allowedRoots: config.allowedRoots,
+      readOnly: config.readOnly,
+      maxFileBytes: config.maxFileBytes,
+    }),
     terminalRegistryLayer({
       readOnly: config.readOnly,
       maxTerminals: config.maxTerminals,
       outputByteLimit: config.terminalOutputLimit,
     }),
     Layer.provide(settingsLayer(config), acp),
-    Layer.provide(taskRegistryLayer, acp),
+    Layer.provide(
+      taskRegistryLayer({
+        maxTasks: config.maxTasks,
+        promptTimeoutMs: config.promptTimeoutMs,
+        permissionTimeoutMs: config.permissionTimeoutMs,
+      }),
+      acp,
+    ),
   );
 
   const background = Layer.effectDiscard(
     Effect.gen(function* () {
       const client = yield* AcpClient;
       yield* Effect.forkScoped(client.connect);
-      yield* startRequestHandler;
+      yield* startRequestHandler(config);
     }),
   ).pipe(Layer.provide(core));
 
-  return Layer.mergeAll(routes, background).pipe(Layer.provideMerge(core));
+  return Layer.mergeAll(routes(config), background).pipe(Layer.provideMerge(core));
 };

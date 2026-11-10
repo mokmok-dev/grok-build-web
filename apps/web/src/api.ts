@@ -1,20 +1,13 @@
 import type {
   ChatMessage,
-  PlanEntry,
-  QueueEntry,
+  TaskDetail,
   TaskStatus,
   TaskSummary,
   Usage,
 } from "@grok-build-web/task-model";
 import type { UIMessage } from "@tanstack/ai-react";
 
-export interface TaskDetail extends TaskSummary {
-  readonly messages: readonly ChatMessage[];
-  readonly plan: readonly PlanEntry[];
-  readonly availableCommands: readonly unknown[];
-  readonly configOptions: readonly unknown[];
-  readonly queue: readonly QueueEntry[];
-}
+export type { TaskDetail };
 
 export interface Health {
   readonly ok: boolean;
@@ -56,57 +49,49 @@ export interface CreateTaskBody {
 }
 
 export interface PermissionDecision {
+  readonly requestId: string;
   readonly optionId?: string;
   readonly decision?: "cancel";
 }
 
-const parseJson = async <A>(response: Response): Promise<A> => {
+type Method = "GET" | "POST" | "PUT";
+
+const send = async <A>(method: Method, path: string, body?: unknown): Promise<A> => {
+  const response = await fetch(path, {
+    method,
+    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
   if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error ?? `Request failed with ${response.status}`);
+    const payload = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new Error(payload.error ?? `Request failed with ${response.status}`);
   }
   return (await response.json()) as A;
 };
 
-const get = <A>(path: string): Promise<A> => fetch(path).then((response) => parseJson<A>(response));
-
-const post = <A>(path: string, body: unknown): Promise<A> =>
-  fetch(path, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  }).then((response) => parseJson<A>(response));
-
-const put = <A>(path: string, body: unknown): Promise<A> =>
-  fetch(path, {
-    method: "PUT",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  }).then((response) => parseJson<A>(response));
-
-export const fetchHealth = (): Promise<Health> => get<Health>("/api/health");
-export const fetchSettings = (): Promise<Settings> => get<Settings>("/api/settings");
-export const fetchAgent = (): Promise<AgentInfo> => get<AgentInfo>("/api/agent");
+export const fetchHealth = (): Promise<Health> => send<Health>("GET", "/api/health");
+export const fetchSettings = (): Promise<Settings> => send<Settings>("GET", "/api/settings");
+export const fetchAgent = (): Promise<AgentInfo> => send<AgentInfo>("GET", "/api/agent");
 export const fetchTasks = (): Promise<readonly TaskSummary[]> =>
-  get<{ tasks: readonly TaskSummary[] }>("/api/tasks").then((body) => body.tasks);
+  send<{ tasks: readonly TaskSummary[] }>("GET", "/api/tasks").then((body) => body.tasks);
 export const fetchTask = (id: string): Promise<TaskDetail> =>
-  get<TaskDetail>(`/api/tasks/${encodeURIComponent(id)}`);
+  send<TaskDetail>("GET", `/api/tasks/${encodeURIComponent(id)}`);
 export const createTask = (body: CreateTaskBody): Promise<TaskDetail> =>
-  post<TaskDetail>("/api/tasks", body);
+  send<TaskDetail>("POST", "/api/tasks", body);
 export const promptTask = (id: string, text: string): Promise<unknown> =>
-  post(`/api/tasks/${encodeURIComponent(id)}/prompt`, { text });
+  send("POST", `/api/tasks/${encodeURIComponent(id)}/prompt`, { text });
 export const cancelTask = (id: string): Promise<unknown> =>
-  post(`/api/tasks/${encodeURIComponent(id)}/cancel`, {});
+  send("POST", `/api/tasks/${encodeURIComponent(id)}/cancel`, {});
 export const closeTask = (id: string): Promise<unknown> =>
-  post(`/api/tasks/${encodeURIComponent(id)}/close`, {});
+  send("POST", `/api/tasks/${encodeURIComponent(id)}/close`, {});
 export const respondPermission = (id: string, body: PermissionDecision): Promise<unknown> =>
-  post(`/api/tasks/${encodeURIComponent(id)}/permission`, body);
+  send("POST", `/api/tasks/${encodeURIComponent(id)}/permission`, body);
 export const saveSettings = (body: {
   readonly url?: string;
   readonly secret?: string;
   readonly defaultCwd?: string;
   readonly defaultModel?: string;
-}): Promise<Settings> => put<Settings>("/api/settings", body);
+}): Promise<Settings> => send<Settings>("PUT", "/api/settings", body);
 
 export const basename = (path: string): string => {
   const parts = path.split("/").filter((part) => part !== "");
@@ -134,24 +119,34 @@ export const usageLine = (usage: Usage): string => {
   return parts.join(" · ");
 };
 
-export const statusLabel = (status: TaskStatus): string => {
-  switch (status) {
-    case "starting":
-      return "Starting";
-    case "idle":
-      return "Idle";
-    case "running":
-      return "Running";
-    case "awaiting_permission":
-      return "Awaiting permission";
-    case "error":
-      return "Error";
-    case "closed":
-      return "Closed";
-  }
+export const STATUS_LABELS: Record<TaskStatus, string> = {
+  starting: "Starting",
+  idle: "Idle",
+  running: "Running",
+  awaiting_permission: "Awaiting permission",
+  error: "Error",
+  closed: "Closed",
 };
 
-export const toInitialMessages = (detail: TaskDetail): UIMessage[] =>
+export const statusLabel = (status: TaskStatus): string => STATUS_LABELS[status];
+
+export type Connection = "connected" | "reconnecting" | "disconnected";
+
+export const connectionOf = (health: Health | null): Connection => {
+  if (health === null) return "disconnected";
+  if (health.acp.connected) return "connected";
+  return health.acp.lastError === undefined ? "disconnected" : "reconnecting";
+};
+
+export const CONNECTION_LABELS: Record<Connection, string> = {
+  connected: "Connected",
+  reconnecting: "Reconnecting",
+  disconnected: "Disconnected",
+};
+
+export const toInitialMessages = (detail: {
+  readonly messages: readonly ChatMessage[];
+}): UIMessage[] =>
   detail.messages.map((message) => ({
     id: message.id,
     role: message.role,
