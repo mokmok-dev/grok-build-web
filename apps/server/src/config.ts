@@ -2,6 +2,7 @@ import { AcpClient, isWithin } from "@grok-build-web/acp-client";
 import { Context, Effect, Layer, Ref } from "effect";
 import { resolve } from "node:path";
 import { isUsableRoot } from "./paths.ts";
+import { realpathOfExistingAncestor } from "./realpath.ts";
 
 export interface ServerConfig {
   readonly acpUrl: string;
@@ -50,8 +51,10 @@ export const resolveDefaultCwd = (value: string | undefined, serverCwd: string):
   return isUsableRoot(resolved) ? resolved : serverCwd;
 };
 
-export const loadConfig = (env: Record<string, string | undefined> = process.env): ServerConfig => {
-  const serverCwd = process.cwd();
+export const loadConfig = (
+  env: Record<string, string | undefined> = process.env,
+  serverCwd: string = process.cwd(),
+): ServerConfig => {
   return {
     acpUrl: env["GROK_ACP_URL"] ?? "ws://127.0.0.1:2419/ws",
     acpSecret: nonEmpty(env["GROK_ACP_SECRET"] ?? env["GROK_AGENT_SECRET"]),
@@ -150,25 +153,36 @@ export const makeSettings = (
         if (url === undefined) {
           return { ok: false, message: "Invalid ACP WebSocket URL (expected ws:// or wss://)" };
         }
-        const defaultCwd =
-          patch.defaultCwd === undefined
-            ? previous.defaultCwd
-            : resolve(config.serverCwd, patch.defaultCwd);
-        if (!isUsableRoot(defaultCwd)) {
-          return {
-            ok: false,
-            message: "The default working directory cannot be the filesystem root",
-          };
-        }
-        if (
-          config.allowedRoots.length > 0 &&
-          !isWithin(defaultCwd, config.serverCwd) &&
-          !config.allowedRoots.some((root) => isWithin(defaultCwd, root))
-        ) {
-          return {
-            ok: false,
-            message: "The default working directory is outside the allowed roots",
-          };
+        let defaultCwd = previous.defaultCwd;
+        if (patch.defaultCwd !== undefined) {
+          // Canonicalise, so a symlink cannot install a root outside the allowed roots.
+          const candidate = yield* Effect.promise(() =>
+            realpathOfExistingAncestor(resolve(config.serverCwd, patch.defaultCwd ?? "")),
+          );
+          if (!isUsableRoot(candidate)) {
+            return {
+              ok: false,
+              message: "The default working directory cannot be the filesystem root",
+            };
+          }
+          if (config.allowedRoots.length > 0) {
+            const serverRoot = yield* Effect.promise(() =>
+              realpathOfExistingAncestor(config.serverCwd),
+            );
+            const roots = yield* Effect.promise(() =>
+              Promise.all(config.allowedRoots.map(realpathOfExistingAncestor)),
+            );
+            if (
+              !isWithin(candidate, serverRoot) &&
+              !roots.some((root) => isWithin(candidate, root))
+            ) {
+              return {
+                ok: false,
+                message: "The default working directory is outside the allowed roots",
+              };
+            }
+          }
+          defaultCwd = candidate;
         }
         const next: SettingsState = {
           url,

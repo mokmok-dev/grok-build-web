@@ -1,10 +1,14 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Effect, Layer } from "effect";
+import { HttpRouter, HttpServer } from "effect/http";
+import { NetAddress } from "effect/net";
+import { NodeHttpServer } from "@effect/platform-node";
 import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
-import { HttpRouter } from "effect/http";
 import { appLayer } from "../src/app.ts";
 import { loadConfig, type ServerConfig } from "../src/config.ts";
 
@@ -13,8 +17,8 @@ type Frame = Record<string, unknown>;
 interface FakeOptions {
   readonly failPrompts?: boolean;
   readonly failAfterUpdates?: boolean;
-  readonly promptDelayMs?: number;
   readonly holdPrompts?: boolean;
+  readonly withholdReply?: boolean;
 }
 
 interface FakeAcp {
@@ -25,7 +29,11 @@ interface FakeAcp {
   readonly sendRequest: (id: number, method: string, params: unknown) => void;
   readonly sendNotification: (method: string, params: unknown) => void;
   readonly releasePrompt: () => boolean;
-  readonly waitForFrame: (predicate: (frame: Frame) => boolean, label: string) => Promise<Frame>;
+  readonly waitForFrame: (
+    predicate: (frame: Frame) => boolean,
+    label: string,
+    timeoutMs?: number,
+  ) => Promise<Frame>;
   readonly close: () => Promise<void>;
 }
 
@@ -138,13 +146,15 @@ const startFakeAcp = async (options: FakeOptions = {}): Promise<FakeAcp> => {
               update: { sessionUpdate: "turn_completed", usage: { totalTokens: 3 } },
             });
             notify("_x.ai/session/prompt_complete", { sessionId, promptId: "p" });
-            respond(socket, id, { stopReason: "end_turn", usage: { totalTokens: 3 } });
+            if (options.withholdReply !== true) {
+              respond(socket, id, { stopReason: "end_turn", usage: { totalTokens: 3 } });
+            }
           };
           if (options.holdPrompts === true) {
             heldPrompts.push(finish);
             return;
           }
-          setTimeout(finish, options.promptDelayMs ?? 20);
+          finish();
           return;
         }
         case "session/cancel":
@@ -181,11 +191,14 @@ const startFakeAcp = async (options: FakeOptions = {}): Promise<FakeAcp> => {
       next();
       return true;
     },
-    waitForFrame: (predicate, label) => {
+    waitForFrame: (predicate, label, timeoutMs = 3_000) => {
       const found = received.find(predicate);
       if (found !== undefined) return Promise.resolve(found);
       return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), 3_000);
+        const timer = setTimeout(
+          () => reject(new Error(`timed out waiting for ${label}`)),
+          timeoutMs,
+        );
         waiters.push({
           predicate,
           resolve: (frame) => {
@@ -335,7 +348,7 @@ describe("server", () => {
   });
 
   it("creates a task, streams a prompt and closes it", async () => {
-    const harness = await startHarness();
+    const harness = await startHarness({ holdPrompts: true });
     await connected(harness);
 
     const created = await call(harness.handler, "POST", "/api/tasks", {
@@ -350,6 +363,12 @@ describe("server", () => {
     expect(detail.status).toBe("running");
     expect(detail.yolo).toBe(false);
     expect(detail.messages[0]).toMatchObject({ role: "user" });
+
+    await harness.acp.waitForFrame(
+      (frame) => frame["method"] === "session/prompt",
+      "the first prompt",
+    );
+    harness.acp.releasePrompt();
 
     const tasks = await json<{ tasks: Array<{ id: string }> }>(
       await call(harness.handler, "GET", "/api/tasks"),
@@ -533,6 +552,83 @@ describe("server", () => {
     expect(ends).toContain("tool");
   });
 
+  it("accepts a follow-up prompt when the reply is withheld after the turn ends", async () => {
+    const harness = await startHarness({ withholdReply: true });
+    await connected(harness);
+    const detail = await createTask(harness);
+    const first = await call(harness.handler, "POST", `/api/tasks/${detail.id}/prompt`, {
+      text: "first",
+    });
+    expect(first.status).toBe(200);
+    await harness.acp.waitForFrame(
+      (frame) => frame["method"] === "session/prompt",
+      "the first prompt",
+    );
+    await waitFor(async () => {
+      const task = await json<{ status: string }>(
+        await call(harness.handler, "GET", `/api/tasks/${detail.id}`),
+      );
+      return task.status === "idle" ? true : undefined;
+    });
+    const second = await call(harness.handler, "POST", `/api/tasks/${detail.id}/prompt`, {
+      text: "second",
+    });
+    expect(second.status).toBe(200);
+  });
+
+  it("reports terminal spawn failures and unknown waits", async () => {
+    const harness = await startHarness();
+    await connected(harness);
+    const detail = await createTask(harness);
+
+    harness.acp.sendRequest(920, "terminal/create", {
+      sessionId: detail.id,
+      command: "definitely-not-a-command-xyz",
+      args: [],
+    });
+    const created = await harness.acp.waitForFrame(
+      (frame) => frame["id"] === 920 && frame["result"] !== undefined,
+      "the terminal id",
+    );
+    const terminalId = (created["result"] as { terminalId: string }).terminalId;
+
+    harness.acp.sendRequest(921, "terminal/wait_for_exit", { sessionId: detail.id, terminalId });
+    const waitError = await harness.acp.waitForFrame(
+      (frame) => frame["id"] === 921 && frame["error"] !== undefined,
+      "the spawn failure",
+    );
+    expect(String((waitError["error"] as { message?: string }).message)).toContain(
+      "Failed to start",
+    );
+
+    harness.acp.sendRequest(922, "terminal/wait_for_exit", {
+      sessionId: detail.id,
+      terminalId: "terminal-999",
+    });
+    const unknown = await harness.acp.waitForFrame(
+      (frame) => frame["id"] === 922 && frame["error"] !== undefined,
+      "the unknown terminal",
+    );
+    expect(String((unknown["error"] as { message?: string }).message)).toContain(
+      "Unknown terminal",
+    );
+
+    let outputError: Frame | undefined;
+    for (let attempt = 0; attempt < 40 && outputError === undefined; attempt += 1) {
+      const id = 930 + attempt;
+      harness.acp.sendRequest(id, "terminal/output", { sessionId: detail.id, terminalId });
+      outputError = await harness.acp
+        .waitForFrame(
+          (frame) => frame["id"] === id && frame["error"] !== undefined,
+          "the error",
+          100,
+        )
+        .catch(() => undefined);
+    }
+    if (outputError === undefined) throw new Error("terminal output never reported the failure");
+    expect(String((outputError["error"] as { message?: string }).message)).toContain("ENOENT");
+  });
+
   it("times out a prompt that never settles", async () => {
     const harness = await startHarness({
       holdPrompts: true,
@@ -599,6 +695,34 @@ describe("server", () => {
 
     const heartbeats = await reader.readUntil((text) => text.includes("heartbeat"));
     expect(heartbeats).toContain('"type":"heartbeat"');
+    await reader.cancel();
+  });
+
+  it("requires JSON on permission and settings and caps chat streams", async () => {
+    const harness = await startHarness({ env: { GROK_WEB_MAX_SSE_CLIENTS: "1" } });
+    await connected(harness);
+    const detail = await createTask(harness);
+
+    const permission = await rawCall(
+      harness.handler,
+      "POST",
+      `/api/tasks/${detail.id}/permission`,
+      { body: "text", headers: { "content-type": "text/plain" } },
+    );
+    expect(permission.status).toBe(415);
+    const settings = await rawCall(harness.handler, "PUT", "/api/settings", {
+      body: "text",
+      headers: { "content-type": "text/plain" },
+    });
+    expect(settings.status).toBe(415);
+
+    const events = await call(harness.handler, "GET", "/api/events");
+    const reader = sseReader(events);
+    await reader.readUntil((text) => text.includes('"type":"tasks"'));
+    const chat = await call(harness.handler, "POST", `/api/tasks/${detail.id}/chat`, {
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(chat.status).toBe(429);
     await reader.cancel();
   });
 
@@ -720,6 +844,47 @@ describe("server", () => {
     expect(malformed.status).toBe(400);
   });
 
+  it("returns 413 for an oversized body on the Node transport", async () => {
+    const acp = await startFakeAcp();
+    const cwd = await mkdtemp(join(tmpdir(), "grok-web-node-"));
+    const config = loadConfig({
+      GROK_ACP_URL: acp.url,
+      GROK_ACP_SECRET: "testsecret",
+      GROK_WEB_DEFAULT_CWD: cwd,
+    });
+    const infra = NodeHttpServer.layer(() => createServer(), { port: 0, host: "127.0.0.1" });
+    const app = HttpRouter.serve(appLayer(config), {
+      disableLogger: true,
+      disableListenLog: true,
+    }).pipe(Layer.provide(infra));
+    // Merge the infra layer so the built context exposes the listening address.
+    const server = Layer.merge(infra, app);
+    try {
+      const status = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const context = yield* Layer.build(server);
+            return yield* Effect.gen(function* () {
+              const running = yield* HttpServer.HttpServer;
+              const url = NetAddress.formatUrlUnsafe(running.address);
+              const response = yield* Effect.promise(() =>
+                fetch(`${url}/api/tasks`, {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({ cwd, padding: "x".repeat(300_000) }),
+                }),
+              );
+              return response.status;
+            }).pipe(Effect.provide(context));
+          }),
+        ),
+      );
+      expect(status).toBe(413);
+    } finally {
+      await acp.close();
+    }
+  });
+
   it("validates the task working directory", async () => {
     const harness = await startHarness();
     await connected(harness);
@@ -824,7 +989,7 @@ describe("server", () => {
       "the terminal id",
     );
     const terminalId = (created["result"] as { terminalId: string }).terminalId;
-    expect(terminalId).toBe("terminal-1");
+    expect(terminalId).toMatch(/^terminal-\d+$/);
 
     harness.acp.sendRequest(902, "terminal/output", { sessionId: detail.id, terminalId });
     const output = await harness.acp.waitForFrame(

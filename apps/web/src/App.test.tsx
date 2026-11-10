@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App.tsx";
 import * as api from "./api.ts";
 
@@ -33,6 +33,26 @@ interface Call {
   readonly body: unknown;
 }
 
+const chat = vi.hoisted(() => ({
+  sendMessage: vi.fn(async () => undefined),
+  onFinish: undefined as (() => void) | undefined,
+  error: undefined as Error | undefined,
+  isLoading: false,
+}));
+
+vi.mock("@tanstack/ai-react", () => ({
+  fetchServerSentEvents: (url: string) => ({ url }),
+  useChat: (options: { onFinish?: () => void }) => {
+    chat.onFinish = options.onFinish;
+    return {
+      messages: [],
+      sendMessage: chat.sendMessage,
+      error: chat.error,
+      isLoading: chat.isLoading,
+    };
+  },
+}));
+
 const calls: Call[] = [];
 
 class FakeEventSource {
@@ -59,8 +79,10 @@ const waitForCall = async (method: string, path: string): Promise<void> => {
   }
 };
 
+type RouteResult = { readonly status?: number; readonly body: unknown };
+
 const installFetch = (
-  handler: (call: Call) => { readonly status?: number; readonly body: unknown } | undefined,
+  handler: (call: Call) => RouteResult | undefined | Promise<RouteResult | undefined>,
 ): void => {
   vi.stubGlobal(
     "fetch",
@@ -73,7 +95,7 @@ const installFetch = (
         body: init?.body === undefined ? undefined : JSON.parse(String(init.body)),
       };
       calls.push(call);
-      const result = handler(call);
+      const result = await handler(call);
       if (result === undefined) {
         return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
       }
@@ -122,6 +144,14 @@ const baseRoutes = (call: Call): { status?: number; body: unknown } | undefined 
       return undefined;
   }
 };
+
+beforeEach(() => {
+  chat.sendMessage.mockClear();
+  chat.sendMessage.mockImplementation(async () => undefined);
+  chat.error = undefined;
+  chat.isLoading = false;
+  chat.onFinish = undefined;
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -194,7 +224,7 @@ describe("App", () => {
 
     calls.splice(0);
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await waitForCall("GET", "/api/tasks/s1");
+    await waitForCall("GET", "/api/tasks");
     await user.click(screen.getByRole("button", { name: "Close" }));
     await waitForCall("POST", "/api/tasks/s1/close");
   });
@@ -303,6 +333,105 @@ describe("App", () => {
       defaultCwd: "/tmp/work",
       defaultModel: undefined,
     });
+  });
+
+  it("sends composer text through useChat and refetches on finish", async () => {
+    const user = userEvent.setup();
+    installFetch((call) => {
+      if (call.path === "/api/tasks/s1") return { body: detail() };
+      if (call.path === "/api/tasks" && call.method === "GET") {
+        return { body: { tasks: [summary] } };
+      }
+      return baseRoutes(call);
+    });
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /My task/ }));
+    await screen.findByLabelText("Message");
+    await user.type(screen.getByLabelText("Message"), "hello");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(chat.sendMessage).toHaveBeenCalledWith("hello");
+
+    calls.splice(0);
+    if (chat.onFinish === undefined) throw new Error("chat did not expose onFinish");
+    act(() => {
+      chat.onFinish?.();
+    });
+    await waitForCall("GET", "/api/tasks/s1");
+  });
+
+  it("renders a chat error", async () => {
+    const user = userEvent.setup();
+    chat.error = new Error("stream broke");
+    installFetch(baseRoutes);
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /My task/ }));
+    expect(await screen.findByText("stream broke")).toBeTruthy();
+  });
+
+  it("surfaces a failed detail load and a failed health probe", async () => {
+    const user = userEvent.setup();
+    installFetch((call) => {
+      if (call.path === "/api/health") throw new Error("health down");
+      if (call.path === "/api/tasks/s1") return { status: 500, body: { error: "detail failed" } };
+      return baseRoutes(call);
+    });
+    render(<App />);
+    expect(await screen.findByText("Disconnected")).toBeTruthy();
+    await user.click(await screen.findByRole("button", { name: /My task/ }));
+    expect(await screen.findByText("detail failed")).toBeTruthy();
+  });
+
+  it("ignores a stale detail response after the selection moved on", async () => {
+    const user = userEvent.setup();
+    let releaseFirst: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    installFetch(async (call) => {
+      if (call.path === "/api/tasks") {
+        return { body: { tasks: [summary, { ...summary, id: "s2", title: "Second" }] } };
+      }
+      if (call.path === "/api/tasks/s1") {
+        await gate;
+        return { body: detail({ title: "Old" }) };
+      }
+      if (call.path === "/api/tasks/s2") {
+        return { body: detail({ id: "s2", title: "Second" }) };
+      }
+      return baseRoutes(call);
+    });
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /My task/ }));
+    await user.click(screen.getByRole("button", { name: /Second/ }));
+    expect(await screen.findByRole("heading", { name: "Second" })).toBeTruthy();
+    releaseFirst?.();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(screen.getByRole("heading", { name: "Second" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Old" })).toBeNull();
+  });
+
+  it("moves focus into the drawer and back on mobile", async () => {
+    vi.stubGlobal("matchMedia", () => ({
+      matches: true,
+      media: "",
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    }));
+    installFetch(baseRoutes);
+    render(<App />);
+    await screen.findByText("My task");
+    const menu = screen.getByRole("button", { name: "Open task list" });
+    fireEvent.click(menu);
+    const sidebar = screen.getByRole("complementary", { name: "Tasks" });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(document.activeElement).toBe(sidebar);
+    fireEvent.click(screen.getByRole("button", { name: "Close task list" }));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(document.activeElement).toBe(menu);
   });
 
   it("shows an API error", async () => {

@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { NodeHttpServer } from "@effect/platform-node";
-import { Effect, Fiber, Layer } from "effect";
+import { Effect, Exit, Fiber, Layer } from "effect";
 import { HttpRouter } from "effect/http";
 import { appLayer } from "./app.ts";
 import { loadConfig } from "./config.ts";
@@ -21,7 +21,19 @@ const main = (): void => {
     }),
   );
   const fiber = Effect.runFork(program);
+  let stopping = false;
+
+  // Observe the build so a failure such as EADDRINUSE exits non-zero instead of hanging silently.
+  void Effect.runPromise(Fiber.await(fiber)).then((exit) => {
+    if (stopping) return;
+    if (Exit.isFailure(exit)) {
+      console.error("server failed to start:", String(exit.cause));
+      process.exit(1);
+    }
+  });
+
   const shutdown = (signal: NodeJS.Signals): void => {
+    stopping = true;
     console.log(`received ${signal}, shutting down`);
     Effect.runPromise(Fiber.interrupt(fiber)).then(
       () => process.exit(0),

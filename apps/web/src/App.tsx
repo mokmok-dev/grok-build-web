@@ -211,8 +211,9 @@ export const App = () => {
       mountedRef.current = true;
       return;
     }
-    if (drawerOpen) sidebarRef.current?.focus();
-    else menuRef.current?.focus();
+    // preventScroll keeps the fixed drawer from being scrolled into view by focus().
+    if (drawerOpen) sidebarRef.current?.focus({ preventScroll: true });
+    else menuRef.current?.focus({ preventScroll: true });
   }, [drawerOpen, mobile]);
 
   const connection = connectionOf(health);

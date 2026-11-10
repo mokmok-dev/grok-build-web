@@ -204,7 +204,7 @@ export const routes = (
 
       const respond = <A>(
         effect: Effect.Effect<A, AcpError>,
-        toBody: (value: A) => unknown,
+        toBody: (value: A) => unknown = (value) => value,
       ): Effect.Effect<Response> =>
         effect.pipe(
           Effect.map((value) => json(toBody(value))),
@@ -364,10 +364,7 @@ export const routes = (
             if (!body.ok) return json({ error: body.message }, body.status);
             const record = asRecord(body.value) ?? {};
             const text = asString(record["text"]) ?? "";
-            return yield* respond(
-              registry.prompt(id, text).pipe(Effect.as({ accepted: true })),
-              (body) => body,
-            );
+            return yield* respond(registry.prompt(id, text).pipe(Effect.as({ accepted: true })));
           }),
         ),
       );
@@ -378,10 +375,7 @@ export const routes = (
         guarded(() =>
           Effect.gen(function* () {
             const id = yield* taskId;
-            return yield* respond(
-              registry.cancel(id).pipe(Effect.as({ accepted: true })),
-              (body) => body,
-            );
+            return yield* respond(registry.cancel(id).pipe(Effect.as({ accepted: true })));
           }),
         ),
       );
@@ -394,10 +388,7 @@ export const routes = (
             const id = yield* taskId;
             const task = yield* registry.get(id);
             if (task === undefined) return json({ error: "Task not found" }, 404);
-            return yield* respond(
-              registry.close(id).pipe(Effect.as({ closed: true })),
-              (body) => body,
-            );
+            return yield* respond(registry.close(id).pipe(Effect.as({ closed: true })));
           }),
         ),
       );
@@ -425,7 +416,6 @@ export const routes = (
               registry
                 .respondPermission(id, requestId, decision)
                 .pipe(Effect.as({ accepted: true })),
-              (body) => body,
             );
           }),
         ),

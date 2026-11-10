@@ -102,12 +102,17 @@ export const readJsonBody = (
     if (mediaType !== "application/json") {
       return { ok: false as const, status: 415, message: "Expected application/json" };
     }
+    const declared = Number(request.headers["content-length"] ?? "");
+    if (Number.isFinite(declared) && declared > limit) {
+      return { ok: false as const, status: 413, message: "Request body is too large" };
+    }
     const body = yield* request.text.pipe(
       Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(limit)),
       Effect.exit,
     );
     if (Exit.isFailure(body)) {
-      return String(body.cause).includes("exceeds")
+      // The Web adapter says "Request body exceeds …"; the Node adapter says "maxBytes exceeded".
+      return /exceed/i.test(String(body.cause))
         ? { ok: false as const, status: 413, message: "Request body is too large" }
         : { ok: false as const, status: 400, message: "Cannot read the request body" };
     }

@@ -3,7 +3,11 @@ import { AcpClient, AcpError, type AcpClientShape } from "@grok-build-web/acp-cl
 import type { ServerNotification } from "@grok-build-web/acp-protocol";
 import { Effect, Fiber, PubSub, Stream } from "effect";
 import { describe, expect, it } from "vitest";
+import { mkdtemp, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { loadConfig, makeSettings, type ServerConfig, type SettingsShape } from "../src/config.ts";
+import { realpathOfExistingAncestor } from "../src/realpath.ts";
 import {
   makeTaskRegistry,
   type TaskRegistryOptions,
@@ -397,6 +401,37 @@ describe("Settings", () => {
     );
     expect(result.outside).toMatchObject({ ok: false });
     expect(result.inside.ok).toBe(true);
+  });
+
+  it("only validates a submitted default cwd and follows symlinks", async () => {
+    const serverRoot = await mkdtemp(join(tmpdir(), "grok-web-settings-"));
+    const allowed = await mkdtemp(join(tmpdir(), "grok-web-allowed-"));
+    const outside = await mkdtemp(join(tmpdir(), "grok-web-outside-"));
+    await symlink(outside, join(serverRoot, "escape"));
+    await symlink(allowed, join(serverRoot, "inside"));
+    const scoped = loadConfig(
+      {
+        GROK_WEB_DEFAULT_CWD: outside,
+        GROK_WEB_ALLOWED_ROOTS: allowed,
+      },
+      serverRoot,
+    );
+    const stub = stubClient({});
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const settings = yield* makeSettings(scoped);
+        const unrelated = yield* settings.update({ defaultModel: "m" });
+        const escape = yield* settings.update({ defaultCwd: "escape" });
+        const inside = yield* settings.update({ defaultCwd: "inside" });
+        return { unrelated, escape, inside };
+      }).pipe(Effect.provideService(AcpClient, stub.client)),
+    );
+    expect(result.unrelated.ok).toBe(true);
+    expect(result.escape).toMatchObject({ ok: false });
+    expect(result.inside.ok).toBe(true);
+    expect(result.inside.ok && result.inside.state.defaultCwd).toBe(
+      await realpathOfExistingAncestor(allowed),
+    );
   });
 
   it("rejects invalid urls and cwds without storing them", async () => {

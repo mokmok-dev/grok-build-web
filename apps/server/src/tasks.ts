@@ -220,7 +220,7 @@ export const makeTaskRegistry = (
         if (task.status === "closed") {
           return yield* new AcpError({ message: "Cannot prompt a closed task" });
         }
-        if (task.promptClaimId !== undefined) {
+        if (task.runningPromptId !== undefined) {
           return yield* new AcpError({ message: "A prompt is already running for this task" });
         }
         const claimId = randomUUID();

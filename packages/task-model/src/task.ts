@@ -66,7 +66,6 @@ export interface Task {
   readonly configOptions: readonly unknown[];
   readonly queue: readonly QueueEntry[];
   readonly runningPromptId?: string;
-  readonly promptClaimId?: string;
   readonly yolo: boolean;
 }
 
@@ -111,7 +110,6 @@ export const createTask = (input: CreateTaskInput): Task => ({
   configOptions: [],
   queue: [],
   runningPromptId: undefined,
-  promptClaimId: undefined,
   yolo: input.yolo ?? false,
 });
 
@@ -127,18 +125,12 @@ export const markClosed = (task: Task, now: number): Task =>
   touched(task, now, { status: "closed" });
 
 export const markError = (task: Task, message: string, now: number): Task =>
-  touched(task, now, {
-    status: "error",
-    lastError: message,
-    runningPromptId: undefined,
-    promptClaimId: undefined,
-  });
+  touched(task, now, { status: "error", lastError: message, runningPromptId: undefined });
 
 export const startPrompt = (task: Task, promptId: string, text: string, now: number): Task =>
   touched(task, now, {
     status: "running",
     runningPromptId: promptId,
-    promptClaimId: promptId,
     messages: [
       ...task.messages,
       {
@@ -152,11 +144,10 @@ export const startPrompt = (task: Task, promptId: string, text: string, now: num
 
 /** Releases the claim, but only for the turn that still owns it. */
 export const finishPrompt = (task: Task, claimId: string, now: number): Task =>
-  task.promptClaimId !== claimId
+  task.runningPromptId !== claimId
     ? task
     : touched(task, now, {
         runningPromptId: undefined,
-        promptClaimId: undefined,
         status: task.pendingPermission === undefined ? "idle" : "awaiting_permission",
       });
 
@@ -173,7 +164,7 @@ export const setPendingPermission = (
 export const resolvePermission = (task: Task, now: number): Task =>
   touched(task, now, {
     pendingPermission: undefined,
-    status: task.promptClaimId === undefined ? "idle" : "running",
+    status: task.runningPromptId === undefined ? "idle" : "running",
   });
 
 export const mergeUsage = (base: Usage, patch: Usage | undefined): Usage => {
@@ -336,7 +327,7 @@ const applySessionNotification = (
         : task;
     case "interaction_resolved":
       return touched(task, now, {
-        status: task.promptClaimId === undefined ? "idle" : "running",
+        status: task.runningPromptId === undefined ? "idle" : "running",
       });
     case "session_summary_generated":
       return task;
@@ -350,8 +341,11 @@ const applyQueueChanged = (
 ): Task =>
   touched(task, now, {
     queue: notification.entries,
-    runningPromptId: notification.runningPromptId,
-    status: notification.runningPromptId === undefined ? "idle" : "running",
+    // The queue reports the agent's turn, not our claim, so it only derives the status.
+    status:
+      notification.runningPromptId === undefined && task.runningPromptId === undefined
+        ? "idle"
+        : "running",
   });
 
 export const applyNotification = (
@@ -367,13 +361,10 @@ export const applyNotification = (
     case "queue_changed":
       return applyQueueChanged(task, notification, now);
     case "prompt_complete":
-      return notification.promptId !== undefined && notification.promptId !== task.runningPromptId
+      // The agent's prompt id is its own, so completion is matched by claim presence, not by id.
+      return task.runningPromptId === undefined
         ? task
-        : touched(task, now, {
-            status: "idle",
-            runningPromptId: undefined,
-            promptClaimId: undefined,
-          });
+        : touched(task, now, { status: "idle", runningPromptId: undefined });
     default:
       return task;
   }
