@@ -24,6 +24,21 @@ pnpm --filter @grok-build-web/web dev   # http://127.0.0.1:5173 (proxies /api to
 `pnpm dev` builds the packages and starts both the API server and the Vite dev server. Set
 `GROK_WEB_API_URL` when the API does not listen on `http://127.0.0.1:3000`; the Vite proxy uses it.
 
+### Tailnet access
+
+`pnpm dev:tailnet` reads the local Tailscale address, binds Vite to that interface, and allows the
+MagicDNS name and IPv4 in both Vite's host check and the API server's `Host` check. Open the printed
+`http://<magicdns>:5173` URL from another device on the tailnet. The API server stays on loopback,
+and Vite proxies `/api` to it.
+
+Anyone the tailnet ACLs allow can use the console, and the console has an unauthenticated API that
+executes commands in the task working directories. Scope access with Tailscale ACLs, or start with
+`GROK_WEB_READ_ONLY=1` for a view-only console.
+
+`pnpm dev:tailnet` sets `GROK_WEB_DEV_HOST` and `GROK_WEB_ALLOWED_HOSTS` for you; set them yourself
+to bind Vite to another interface. For HTTPS, keep Vite on loopback and run
+`tailscale serve --bg 5173` with `GROK_WEB_ALLOWED_HOSTS=<magicdns>`.
+
 ## Server environment
 
 | Variable                                | Default                  | Meaning                                                                           |
