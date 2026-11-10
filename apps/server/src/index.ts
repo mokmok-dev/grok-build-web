@@ -1,1 +1,13 @@
-export const PACKAGE_NAME = "@grok-build-web/server";
+export { appLayer } from "./app.ts";
+export { loadConfig, redactUrl, Settings, settingsLayer } from "./config.ts";
+export type { ServerConfig, SettingsPatch, SettingsShape, SettingsState } from "./config.ts";
+export { routes, requestHandler, startRequestHandler, toDetail } from "./api.ts";
+export type { TaskDetail } from "./api.ts";
+export { chatSse, sseFrame } from "./chat.ts";
+export type { ChatInput } from "./chat.ts";
+export { FsBridge, fsBridgeLayer, makeFsBridge } from "./fs-bridge.ts";
+export type { FsBridgeOptions, FsBridgeShape } from "./fs-bridge.ts";
+export { makeTaskRegistry, TaskRegistry, taskRegistryLayer } from "./tasks.ts";
+export type { CreateTaskInput, TaskRegistryShape } from "./tasks.ts";
+export { makeTerminalRegistry, TerminalRegistry, terminalRegistryLayer } from "./terminal.ts";
+export type { TerminalRegistryOptions, TerminalRegistryShape } from "./terminal.ts";
