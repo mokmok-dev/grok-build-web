@@ -1,0 +1,9 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/acp-protocol" },
+    { "path": "./packages/task-model" },
+    { "path": "./packages/acp-client" },
+    { "path": "./apps/server" }
+  ]
+}

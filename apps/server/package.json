@@ -1,0 +1,24 @@
+{
+  "name": "@grok-build-web/server",
+  "version": "2026.11.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@effect/platform-node": "catalog:",
+    "@grok-build-web/acp-client": "workspace:^",
+    "@grok-build-web/acp-protocol": "workspace:^",
+    "@grok-build-web/task-model": "workspace:^",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@types/ws": "catalog:",
+    "tsx": "catalog:",
+    "vitest": "catalog:",
+    "ws": "catalog:"
+  }
+}

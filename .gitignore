@@ -1,4 +1,10 @@
 **/node_modules
+**/dist
+**/*.tsbuildinfo
+**/.stryker-tmp
+**/coverage
+**/test-results
+**/playwright-report
 .direnv
 .pre-commit-config.yaml
 /result
