@@ -1,0 +1,32 @@
+{
+  "name": "@grok-build-web/web",
+  "version": "2026.11.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite",
+    "e2e": "tsx playwright.e2e.mts"
+  },
+  "dependencies": {
+    "@grok-build-web/task-model": "workspace:^",
+    "@tanstack/ai": "catalog:",
+    "@tanstack/ai-client": "catalog:",
+    "@tanstack/ai-react": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:"
+  },
+  "devDependencies": {
+    "@playwright/test": "catalog:",
+    "@testing-library/dom": "catalog:",
+    "@testing-library/react": "catalog:",
+    "@testing-library/user-event": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@vitejs/plugin-react": "catalog:",
+    "jsdom": "catalog:",
+    "tsx": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}

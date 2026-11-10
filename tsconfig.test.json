@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "baseUrl": ".",
+    "paths": {
+      "@grok-build-web/acp-protocol": ["./packages/acp-protocol/src/index.ts"],
+      "@grok-build-web/task-model": ["./packages/task-model/src/index.ts"],
+      "@grok-build-web/acp-client": ["./packages/acp-client/src/index.ts"],
+      "@grok-build-web/server": ["./apps/server/src/index.ts"]
+    }
+  },
+  "include": [
+    "packages/*/src/**/*.ts",
+    "packages/*/test/**/*.ts",
+    "apps/server/src/**/*.ts",
+    "apps/server/test/**/*.ts"
+  ]
+}

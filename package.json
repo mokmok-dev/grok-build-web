@@ -1,9 +1,26 @@
 {
   "name": "@grok-build-web/monorepo",
   "version": "2026.11.1",
+  "private": true,
   "type": "module",
   "scripts": {
-    "test": "echo \"test\"",
-    "typecheck": "echo \"typecheck\""
-  }
+    "build": "tsc -b tsconfig.json && pnpm --filter @grok-build-web/web build",
+    "dev": "tsc -b tsconfig.json && concurrently -k -n server,web -c blue,green \"pnpm --filter @grok-build-web/server dev\" \"pnpm --filter @grok-build-web/web dev\"",
+    "e2e": "pnpm --filter @grok-build-web/web e2e",
+    "mutation": "pnpm -r --filter \"./packages/*\" --workspace-concurrency=1 --if-present mutation",
+    "test": "vitest --run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.test.json && tsc -p apps/web/tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "concurrently": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@12.9.0"
 }
