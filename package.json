@@ -1,0 +1,9 @@
+{
+  "name": "@grok-build-web/monorepo",
+  "version": "2026.11.1",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"test\"",
+    "typecheck": "echo \"typecheck\""
+  }
+}

@@ -1,0 +1,9 @@
+packages:
+  - apps/*
+  - packages/*
+
+catalog:
+
+catalogMode: strict
+
+catalogPrune: true
