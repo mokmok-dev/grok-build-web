@@ -13,7 +13,8 @@
     }
   },
   "scripts": {
-    "build": "tsc -b"
+    "build": "tsc -b",
+    "mutation": "stryker run"
   },
   "dependencies": {
     "@grok-build-web/acp-protocol": "workspace:^",
