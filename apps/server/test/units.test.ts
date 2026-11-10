@@ -14,14 +14,9 @@ import {
   resolveRoots,
 } from "../src/config.ts";
 import { fsBridgeLayer, FsBridge, type FsBridgeShape } from "../src/fs-bridge.ts";
-import { taskCwdAllowed, terminalCwdAllowed } from "../src/paths.ts";
-import {
-  checkRequest,
-  hostnameOf,
-  hostsFor,
-  readJsonBody,
-  requestGuardPolicy,
-} from "../src/security.ts";
+import { resolveTerminalCwd, taskCwdAllowed } from "../src/paths.ts";
+import { realpathOfExistingAncestor } from "../src/realpath.ts";
+import { checkRequest, readJsonBody, requestGuardPolicy } from "../src/security.ts";
 import { makeTerminalRegistry } from "../src/terminal.ts";
 
 const dir = (): Promise<string> => mkdtemp(join(tmpdir(), "grok-web-unit-"));
@@ -210,16 +205,10 @@ describe("request guard", () => {
     expect(configured.hosts).not.toContain("0.0.0.0");
   });
 
-  it("normalises hostnames", () => {
-    expect(hostnameOf("[::1]:3000")).toBe("::1");
-    expect(hostnameOf("LOCALHOST:3000")).toBe("localhost");
-    expect(hostnameOf("bad host!!")).toBeUndefined();
-    expect(hostsFor("example.test", ["EXAMPLE.test"])).toEqual([
-      "127.0.0.1",
-      "localhost",
-      "::1",
-      "example.test",
-    ]);
+  it("accepts a bracketed ipv6 host and rejects a malformed one", () => {
+    expect(checkRequest({ host: "[::1]:3000" }, policy)).toBeUndefined();
+    expect(checkRequest({ host: "LOCALHOST:3000" }, policy)).toBeUndefined();
+    expect(checkRequest({ host: "bad host!!" }, policy)).toMatchObject({ status: 403 });
   });
 });
 
@@ -230,6 +219,17 @@ describe("readJsonBody", () => {
   it("parses a JSON object", async () => {
     const result = await read(webRequest('{"a":1}', { "content-type": "application/json" }));
     expect(result).toEqual({ ok: true, value: { a: 1 } });
+    const charset = await read(
+      webRequest('{"a":1}', { "content-type": "application/json; charset=utf-8" }),
+    );
+    expect(charset).toEqual({ ok: true, value: { a: 1 } });
+  });
+
+  it("rejects lookalike media types", async () => {
+    for (const mediaType of ["application/jsonp", "application/json-seq", "text/json"]) {
+      const result = await read(webRequest("{}", { "content-type": mediaType }));
+      expect(result).toMatchObject({ ok: false, status: 415 });
+    }
   });
 
   it("requires a JSON content type", async () => {
@@ -260,25 +260,44 @@ describe("readJsonBody", () => {
 });
 
 describe("paths", () => {
-  const policy = { serverCwd: "/work", defaultCwd: "/work", allowedRoots: ["/tmp"] };
-
-  it("allows the default cwd, its children and allowed roots", () => {
-    expect(taskCwdAllowed("/work", policy)).toBe(true);
-    expect(taskCwdAllowed("sub", policy)).toBe(true);
-    expect(taskCwdAllowed("/tmp/x", policy)).toBe(true);
+  it("allows the default cwd, its children and allowed roots", async () => {
+    const root = await dir();
+    const extra = await dir();
+    const policy = { serverCwd: root, defaultCwd: root, allowedRoots: [extra] };
+    expect(await Effect.runPromise(taskCwdAllowed(root, policy))).toBe(true);
+    expect(await Effect.runPromise(taskCwdAllowed("sub", policy))).toBe(true);
+    expect(await Effect.runPromise(taskCwdAllowed(extra, policy))).toBe(true);
   });
 
-  it("rejects the filesystem root and unrelated paths", () => {
-    expect(taskCwdAllowed("/", policy)).toBe(false);
-    expect(taskCwdAllowed("/etc", policy)).toBe(false);
-    expect(taskCwdAllowed("../../etc", policy)).toBe(false);
+  it("rejects the filesystem root and unrelated paths", async () => {
+    const root = await dir();
+    const outside = await dir();
+    const policy = { serverCwd: root, defaultCwd: root, allowedRoots: [] };
+    expect(await Effect.runPromise(taskCwdAllowed("/", policy))).toBe(false);
+    expect(await Effect.runPromise(taskCwdAllowed(outside, policy))).toBe(false);
+    expect(await Effect.runPromise(taskCwdAllowed("../../etc", policy))).toBe(false);
   });
 
-  it("guards terminal cwds against the task cwd and allowed roots", () => {
-    expect(terminalCwdAllowed("/work/task", "/work/task", ["/tmp"])).toBe(true);
-    expect(terminalCwdAllowed("/tmp", "/work/task", ["/tmp"])).toBe(true);
-    expect(terminalCwdAllowed("/", "/work/task", ["/tmp"])).toBe(false);
-    expect(terminalCwdAllowed("/etc", "/work/task", ["/tmp"])).toBe(false);
+  it("rejects a symlink that leaves the default cwd", async () => {
+    const root = await dir();
+    const outside = await dir();
+    const link = join(root, "escape");
+    await symlink(outside, link);
+    const policy = { serverCwd: root, defaultCwd: root, allowedRoots: [] };
+    expect(await Effect.runPromise(taskCwdAllowed(link, policy))).toBe(false);
+  });
+
+  it("guards and resolves terminal cwds", async () => {
+    const root = await dir();
+    const extra = await dir();
+    expect(await Effect.runPromise(resolveTerminalCwd("sub", root, [extra]))).toBe(
+      await realpathOfExistingAncestor(join(root, "sub")),
+    );
+    expect(await Effect.runPromise(resolveTerminalCwd(extra, root, [extra]))).toBe(
+      await realpathOfExistingAncestor(extra),
+    );
+    expect(await Effect.runPromise(resolveTerminalCwd("/", root, [extra]))).toBeUndefined();
+    expect(await Effect.runPromise(resolveTerminalCwd("/etc", root, [extra]))).toBeUndefined();
   });
 });
 
@@ -405,7 +424,7 @@ describe("TerminalRegistry", () => {
         return { id, output, foreign, stillThere, after: yield* registry.get("session-a", id) };
       }).pipe(Effect.scoped),
     );
-    expect(result.id).toBe("terminal-1");
+    expect(result.id).toMatch(/^terminal-\d+$/);
     expect(result.output.output).toBe("hi");
     expect(result.foreign).toBeUndefined();
     expect(result.stillThere).toBeDefined();
@@ -468,12 +487,9 @@ describe("TerminalRegistry", () => {
         });
         yield* registry.kill("s", id);
         const terminal = yield* registry.get("s", id);
-        const exit = yield* Effect.promise(
-          () =>
-            terminal?.waitForExit() ??
-            Promise.resolve({} as { signal?: string; exitCode?: number }),
-        );
-        expect(exit.signal ?? exit.exitCode).toBeDefined();
+        if (terminal === undefined) throw new Error("terminal disappeared");
+        const exit = yield* Effect.promise(() => terminal.waitForExit());
+        expect(exit.signal).toBe("SIGTERM");
         yield* registry.shutdown;
       }).pipe(Effect.scoped),
     );

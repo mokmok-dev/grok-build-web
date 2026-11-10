@@ -220,14 +220,17 @@ export const makeTaskRegistry = (
         if (task.status === "closed") {
           return yield* new AcpError({ message: "Cannot prompt a closed task" });
         }
-        if (task.runningPromptId !== undefined) {
+        if (task.promptClaimId !== undefined) {
           return yield* new AcpError({ message: "A prompt is already running for this task" });
         }
-        yield* put(startPrompt(task, randomUUID(), text, now()));
+        const claimId = randomUUID();
+        yield* put(startPrompt(task, claimId, text, now()));
+        return claimId;
       });
 
     const runTurn = <A>(
       id: string,
+      claimId: string,
       effect: Effect.Effect<A, AcpError>,
     ): Effect.Effect<A, AcpError> =>
       effect.pipe(
@@ -238,13 +241,16 @@ export const makeTaskRegistry = (
               return yield* Effect.fail(error);
             }),
           onSuccess: (value) =>
-            update(id, (task) => finishPrompt(task, now())).pipe(Effect.as(value)),
+            update(id, (task) => finishPrompt(task, claimId, now())).pipe(Effect.as(value)),
         }),
+        // An aborted stream interrupts the turn; release the claim so the task can be prompted again.
+        Effect.onInterrupt(() => update(id, (task) => finishPrompt(task, claimId, now()))),
       );
 
-    const sendPrompt = (id: string, text: string) =>
+    const sendPrompt = (id: string, claimId: string, text: string) =>
       runTurn(
         id,
+        claimId,
         client.request(
           "session/prompt",
           { sessionId: id, prompt: [{ type: "text", text }] },
@@ -254,14 +260,14 @@ export const makeTaskRegistry = (
 
     const prompt = (id: string, text: string) =>
       Effect.gen(function* () {
-        yield* beginPrompt(id, text);
-        yield* Effect.forkDetach(sendPrompt(id, text).pipe(Effect.ignoreCause));
+        const claimId = yield* beginPrompt(id, text);
+        yield* Effect.forkDetach(sendPrompt(id, claimId, text).pipe(Effect.ignoreCause));
       });
 
     const promptAndWait = (id: string, text: string) =>
       Effect.gen(function* () {
-        yield* beginPrompt(id, text);
-        return parsePromptResult(yield* sendPrompt(id, text));
+        const claimId = yield* beginPrompt(id, text);
+        return parsePromptResult(yield* sendPrompt(id, claimId, text));
       });
 
     const create = (input: CreateTaskInput) =>
@@ -320,12 +326,12 @@ export const makeTaskRegistry = (
       Effect.gen(function* () {
         const taken = yield* Ref.modify(pendingRef, (pending) => {
           const entry = pending.get(requestId);
-          if (entry === undefined) return [undefined, pending];
+          if (entry === undefined || entry.taskId !== id) return [undefined, pending];
           const next = new Map(pending);
           next.delete(requestId);
           return [entry, next];
         });
-        if (taken === undefined || taken.taskId !== id) {
+        if (taken === undefined) {
           return yield* new AcpError({ message: "Unknown permission request" });
         }
         yield* taken.incoming.reply(

@@ -71,6 +71,10 @@ const start = (
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
   });
+  child.on("error", (error) => {
+    errors.push(`spawn ${command}: ${error.message}`);
+    void stopAll().then(() => process.exit(1));
+  });
   child.stdout?.on("data", (chunk: Buffer) => process.stdout.write(`[${command}] ${chunk}`));
   child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[${command}] ${chunk}`));
   children.push(child);
@@ -121,10 +125,15 @@ const run = async (): Promise<void> => {
 
   console.log(`ports: agent=${agentPort} api=${apiPort} web=${webPort}`);
   start("grok", ["agent", "--always-approve", "serve", "--bind", `127.0.0.1:${agentPort}`, "--secret", "testsecret"]);
+  let agentReady = false;
   for (let attempt = 0; attempt < 150; attempt += 1) {
-    if (await reachable(agentPort)) break;
+    if (await reachable(agentPort)) {
+      agentReady = true;
+      break;
+    }
     await delay(200);
   }
+  if (!agentReady) throw new Error(`grok agent did not open port ${agentPort}`);
 
   const serverEntry = resolve(repoRoot, "apps/server/dist/main.js");
   if (!existsSync(serverEntry)) {

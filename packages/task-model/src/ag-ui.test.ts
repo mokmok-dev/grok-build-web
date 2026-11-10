@@ -53,6 +53,54 @@ const eventsOf = (updates: readonly SessionUpdate[]): readonly AgUiEvent[] => {
   return events;
 };
 
+interface ToolSegments {
+  readonly closes: Map<string, number>;
+  readonly openAtEnd: ReadonlySet<string>;
+}
+
+const toolSegments = (updates: readonly SessionUpdate[]): ToolSegments => {
+  const open = new Set<string>();
+  const closes = new Map<string, number>();
+  for (const update of updates) {
+    if (update.sessionUpdate === "tool_call") {
+      open.add(update.toolCallId);
+      continue;
+    }
+    if (
+      update.sessionUpdate === "tool_call_update" &&
+      (update.status === "completed" || update.status === "failed") &&
+      open.has(update.toolCallId)
+    ) {
+      open.delete(update.toolCallId);
+      closes.set(update.toolCallId, (closes.get(update.toolCallId) ?? 0) + 1);
+    }
+  }
+  return { closes, openAtEnd: open };
+};
+
+const countToolEvents = (
+  events: readonly AgUiEvent[],
+  type: "TOOL_CALL_END" | "TOOL_CALL_RESULT",
+) =>
+  events.reduce((counts, event) => {
+    if (event.type !== type) return counts;
+    counts.set(event.toolCallId, (counts.get(event.toolCallId) ?? 0) + 1);
+    return counts;
+  }, new Map<string, number>());
+
+const assertToolResults = (
+  updates: readonly SessionUpdate[],
+  events: readonly AgUiEvent[],
+): void => {
+  const { closes, openAtEnd } = toolSegments(updates);
+  const ends = countToolEvents(events, "TOOL_CALL_END");
+  const results = countToolEvents(events, "TOOL_CALL_RESULT");
+  for (const [id, closeCount] of closes) {
+    expect(results.get(id) ?? 0).toBe(closeCount);
+    expect(ends.get(id) ?? 0).toBe(closeCount + (openAtEnd.has(id) ? 1 : 0));
+  }
+};
+
 const assertBalanced = (events: readonly AgUiEvent[]): void => {
   const depth = new Map<string, number>();
   const started = new Set<string>();
@@ -346,7 +394,9 @@ describe("properties", () => {
               return toolUpdate(item.id, item.status, item.output);
           }
         });
-        assertBalanced(eventsOf(updates));
+        const events = eventsOf(updates);
+        assertBalanced(events);
+        assertToolResults(updates, events);
       }),
     );
   });

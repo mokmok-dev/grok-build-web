@@ -1,15 +1,19 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { open, stat } from "node:fs/promises";
+import { open, type FileHandle } from "node:fs/promises";
 import type { EnvVariable, TerminalExitStatus } from "@grok-build-web/acp-protocol";
 import { truncateOutput } from "./policy.ts";
 
 const SECRET_ENV = ["GROK_ACP_SECRET", "GROK_AGENT_SECRET"];
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-export interface ReadOptions {
-  readonly maxBytes: number;
-}
+const READ_CHUNK = 64 * 1024;
+const READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const WRITE_FLAGS =
+  constants.O_WRONLY |
+  constants.O_CREAT |
+  constants.O_TRUNC |
+  constants.O_NOFOLLOW |
+  constants.O_NONBLOCK;
 
 export interface TerminalOptions {
   readonly command: string;
@@ -58,22 +62,40 @@ export const buildEnvironment = (
   return env;
 };
 
+const assertRegularFile = async (handle: FileHandle, path: string): Promise<number> => {
+  const info = await handle.stat();
+  if (!info.isFile()) throw new Error(`${path} is not a regular file`);
+  return info.size;
+};
+
+const readAll = async (handle: FileHandle, path: string, maxBytes: number): Promise<string> => {
+  const chunks: Buffer[] = [];
+  const buffer = Buffer.alloc(READ_CHUNK);
+  let total = 0;
+  for (;;) {
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+    if (bytesRead === 0) break;
+    total += bytesRead;
+    if (total > maxBytes) throw new Error(`${path} is larger than ${maxBytes} bytes`);
+    chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+};
+
 export const readTextFile = async (
   path: string,
   line: number | undefined,
   limit: number | undefined,
-  options: ReadOptions,
+  maxBytes: number,
 ): Promise<string> => {
-  const info = await stat(path);
-  if (info.size > options.maxBytes) {
-    throw new Error(`File is larger than ${options.maxBytes} bytes`);
-  }
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const handle = await open(path, READ_FLAGS);
   try {
-    const content = await handle.readFile({ encoding: "utf8" });
-    if (line === undefined) return content;
+    const size = await assertRegularFile(handle, path);
+    if (size > maxBytes) throw new Error(`${path} is larger than ${maxBytes} bytes`);
+    const content = await readAll(handle, path, maxBytes);
+    if (line === undefined && limit === undefined) return content;
     const lines = content.split("\n");
-    const start = Math.max(0, line - 1);
+    const start = Math.max(0, (line ?? 1) - 1);
     const end = limit === undefined ? lines.length : start + limit;
     return lines.slice(start, end).join("\n");
   } finally {
@@ -84,17 +106,13 @@ export const readTextFile = async (
 export const writeTextFile = async (
   path: string,
   content: string,
-  options: ReadOptions,
+  maxBytes: number,
 ): Promise<void> => {
-  if (Buffer.byteLength(content, "utf8") > options.maxBytes) {
-    throw new Error(`Content is larger than ${options.maxBytes} bytes`);
-  }
-  const handle = await open(
-    path,
-    constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
-    0o644,
-  );
+  const size = Buffer.byteLength(content, "utf8");
+  if (size > maxBytes) throw new Error(`Content is larger than ${maxBytes} bytes`);
+  const handle = await open(path, WRITE_FLAGS, 0o644);
   try {
+    await assertRegularFile(handle, path);
     await handle.writeFile(content, "utf8");
   } finally {
     await handle.close();
@@ -152,7 +170,8 @@ export const startTerminal = (options: TerminalOptions): TerminalHandle => {
       signalGroup("SIGTERM");
     },
     release: () => {
-      if (exitStatus === undefined) signalGroup("SIGKILL");
+      // Descendants can outlive the leader, so always signal the whole group.
+      signalGroup("SIGKILL");
     },
   };
 };

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App.tsx";
@@ -35,6 +35,30 @@ interface Call {
 
 const calls: Call[] = [];
 
+class FakeEventSource {
+  static readonly instances: FakeEventSource[] = [];
+  onmessage: ((event: MessageEvent<string>) => void) | null = null;
+  readonly url: string;
+  constructor(url: string) {
+    this.url = url;
+    FakeEventSource.instances.push(this);
+  }
+  close(): void {
+    // no-op
+  }
+  emit(payload: unknown): void {
+    this.onmessage?.({ data: JSON.stringify(payload) } as MessageEvent<string>);
+  }
+}
+
+const waitForCall = async (method: string, path: string): Promise<void> => {
+  const started = Date.now();
+  while (!calls.some((call) => call.method === method && call.path === path)) {
+    if (Date.now() - started > 2_000) throw new Error(`no ${method} ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
 const installFetch = (
   handler: (call: Call) => { readonly status?: number; readonly body: unknown } | undefined,
 ): void => {
@@ -59,6 +83,13 @@ const installFetch = (
       });
     }),
   );
+};
+
+const runningRoutes = (call: Call): { status?: number; body: unknown } | undefined => {
+  if (call.path === "/api/tasks" && call.method === "GET") {
+    return { body: { tasks: [{ ...summary, status: "running" }] } };
+  }
+  return baseRoutes(call);
 };
 
 const baseRoutes = (call: Call): { status?: number; body: unknown } | undefined => {
@@ -144,20 +175,79 @@ describe("App", () => {
     });
   });
 
-  it("cancels and closes the selected task", async () => {
+  it("cancels a running task, refreshes and closes it", async () => {
     const user = userEvent.setup();
     installFetch((call) => {
+      if (call.path === "/api/tasks/s1") return { body: detail({ status: "running" }) };
       if (call.path === "/api/tasks/s1/cancel") return { body: { accepted: true } };
       if (call.path === "/api/tasks/s1/close") return { body: { closed: true } };
-      return baseRoutes(call);
+      return runningRoutes(call);
     });
     render(<App />);
     await user.click(await screen.findByRole("button", { name: /My task/ }));
-    await screen.findByRole("button", { name: "Close" });
-    await user.click(screen.getByRole("button", { name: "Close" }));
+    const cancel = await screen.findByRole("button", { name: "Cancel" });
+    expect((cancel as HTMLButtonElement).disabled).toBe(false);
+    await user.click(cancel);
+    expect(
+      calls.some((call) => call.method === "POST" && call.path === "/api/tasks/s1/cancel"),
+    ).toBe(true);
+
+    calls.splice(0);
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    expect(calls.some((call) => call.path === "/api/tasks/s1/close")).toBe(true);
-    expect(calls.some((call) => call.path === "/api/tasks/s1")).toBe(true);
+    await waitForCall("GET", "/api/tasks/s1");
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    await waitForCall("POST", "/api/tasks/s1/close");
+  });
+
+  it("applies task list updates from the event stream", async () => {
+    vi.stubGlobal("EventSource", FakeEventSource);
+    FakeEventSource.instances.splice(0);
+    installFetch(baseRoutes);
+    render(<App />);
+    expect(await screen.findByText("My task")).toBeTruthy();
+    const source = FakeEventSource.instances[0];
+    if (source === undefined) throw new Error("no EventSource");
+    act(() => {
+      source.emit({ type: "tasks", tasks: [{ ...summary, id: "s2", title: "Live task" }] });
+    });
+    expect(await screen.findByText("Live task")).toBeTruthy();
+  });
+
+  it("polls the detail while the selected task runs", async () => {
+    vi.useFakeTimers();
+    FakeEventSource.instances.splice(0);
+    try {
+      let detailCalls = 0;
+      installFetch((call) => {
+        if (call.path === "/api/tasks/s1") {
+          detailCalls += 1;
+          return { body: detail({ status: "running" }) };
+        }
+        return runningRoutes(call);
+      });
+      render(<App />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      act(() => {
+        fireEvent.click(screen.getByRole("button", { name: /My task/ }));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      const first = detailCalls;
+      expect(first).toBeGreaterThan(0);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_100);
+      });
+      expect(detailCalls).toBeGreaterThan(first);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_100);
+      });
+      expect(detailCalls).toBeGreaterThan(first + 1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("answers a pending permission request", async () => {
@@ -237,14 +327,12 @@ describe("api wrappers", () => {
     await api.fetchTasks();
     await api.cancelTask("a b");
     await api.closeTask("ab");
-    await api.promptTask("ab", "hi");
     await api.respondPermission("ab", { requestId: "r", decision: "cancel" });
     await api.saveSettings({ defaultCwd: "/tmp" });
     expect(calls).toEqual([
       { method: "GET", path: "/api/tasks", body: undefined },
       { method: "POST", path: "/api/tasks/a%20b/cancel", body: {} },
       { method: "POST", path: "/api/tasks/ab/close", body: {} },
-      { method: "POST", path: "/api/tasks/ab/prompt", body: { text: "hi" } },
       {
         method: "POST",
         path: "/api/tasks/ab/permission",

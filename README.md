@@ -56,11 +56,13 @@ parameter whose name matches `key|secret|token|password`.
 
 ## Security model
 
-- **Bind loopback by default.** The server also validates every request: the `Host` header must be a
-  loopback name or the configured `HOST` (plus `GROK_WEB_ALLOWED_HOSTS`), and an `Origin` must be
-  absent, same-origin, one of the Vite dev/preview ports, or explicitly allowed. Anything else is a
-  403 before dispatch. A `0.0.0.0` bind accepts only loopback `Host` values unless
-  `GROK_WEB_ALLOWED_HOSTS` is set.
+- **Bind loopback by default.** The server validates the `Host` header (a loopback name, the
+  configured `HOST`, or `GROK_WEB_ALLOWED_HOSTS`) and the `Origin` (absent, same-origin, a Vite
+  dev/preview port, or `GROK_WEB_ALLOWED_ORIGINS`), and rejects anything else with 403 before
+  dispatch. These checks defend against CSRF and DNS rebinding only: `Host` is client-controlled
+  (`curl -H 'Host: 127.0.0.1'` passes), so a non-loopback bind exposes an **unauthenticated API that
+  can execute commands**. Bind to loopback, or put an authenticating proxy in front of any other
+  bind.
 - **JSON only.** Request bodies must be `application/json` (415 otherwise), are read with a byte cap
   (413), and malformed JSON is a 400.
 - **Task cwd is a trust root.** `POST /api/tasks` rejects a cwd outside the default cwd or an allowed
@@ -113,6 +115,10 @@ The Nix flake is the single gate: `pnpmTest`, `pnpmTypecheck`, `pnpmBuild`, `pnp
 and `pre-commit`. There is no duplicate GitHub Actions workflow for the web stack; the existing
 `nix.yaml` workflow runs the flake, so `pnpm install --frozen-lockfile`, the typecheck, the tests, the
 build and the mutation gate are all exercised with the pinned pnpm version.
+
+**Manual gate.** `pnpm e2e` is not part of the flake: it needs a real `grok agent serve`,
+a built server and a Chromium the flake does not ship. The flake covers unit, integration and mutation
+checks; run `pnpm e2e` by hand after `pnpm build` when changing the web UI or the ACP wiring.
 
 **Mutation scope.** Stryker mutates `packages/*` — `acp-protocol`, `task-model`, and the pure modules
 of `acp-client` (`jsonrpc-client.ts`, `backoff.ts`, `policy.ts`) — and must keep a 100% score with a

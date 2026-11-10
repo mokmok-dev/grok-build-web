@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   basename,
+  connectionOf,
   relativeTime,
-  statusLabel,
+  STATUS_LABELS,
   taskTitle,
   toInitialMessages,
   usageLine,
@@ -35,12 +36,25 @@ describe("relativeTime", () => {
 
 describe("labels", () => {
   it("names every status", () => {
-    expect(statusLabel("starting")).toBe("Starting");
-    expect(statusLabel("idle")).toBe("Idle");
-    expect(statusLabel("running")).toBe("Running");
-    expect(statusLabel("awaiting_permission")).toBe("Awaiting permission");
-    expect(statusLabel("error")).toBe("Error");
-    expect(statusLabel("closed")).toBe("Closed");
+    expect(STATUS_LABELS).toEqual({
+      starting: "Starting",
+      idle: "Idle",
+      running: "Running",
+      awaiting_permission: "Awaiting permission",
+      error: "Error",
+      closed: "Closed",
+    });
+  });
+
+  it("derives the connection state from health", () => {
+    expect(connectionOf(null)).toBe("disconnected");
+    expect(connectionOf({ ok: true, acp: { connected: true, url: "ws://x" } })).toBe("connected");
+    expect(connectionOf({ ok: true, acp: { connected: false, url: "ws://x" } })).toBe(
+      "disconnected",
+    );
+    expect(
+      connectionOf({ ok: true, acp: { connected: false, url: "ws://x", lastError: "lost" } }),
+    ).toBe("reconnecting");
   });
 
   it("falls back for an untitled task", () => {

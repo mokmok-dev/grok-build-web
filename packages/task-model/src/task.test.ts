@@ -116,18 +116,22 @@ describe("lifecycle", () => {
   });
 
   it("marks a task errored and clears the running prompt", () => {
-    expect(markError(task({ runningPromptId: "p1" }), "boom", 7)).toMatchObject({
+    expect(
+      markError(task({ runningPromptId: "p1", promptClaimId: "c1" }), "boom", 7),
+    ).toMatchObject({
       status: "error",
       lastError: "boom",
       runningPromptId: undefined,
+      promptClaimId: undefined,
       updatedAt: 7,
     });
   });
 
-  it("appends a user message and records the running prompt", () => {
+  it("appends a user message and records the running prompt claim", () => {
     const next = startPrompt(task(), "p1", "hello", 7);
     expect(next.status).toBe("running");
     expect(next.runningPromptId).toBe("p1");
+    expect(next.promptClaimId).toBe("p1");
     expect(next.messages).toEqual([
       { id: "user-0", role: "user", createdAt: 7, parts: [{ type: "text", text: "hello" }] },
     ]);
@@ -135,17 +139,35 @@ describe("lifecycle", () => {
   });
 
   it("finishes a prompt into idle or awaiting permission", () => {
-    expect(finishPrompt(task({ status: "running", runningPromptId: "p1" }), 8)).toMatchObject({
+    expect(
+      finishPrompt(
+        task({ status: "running", runningPromptId: "p1", promptClaimId: "c1" }),
+        "c1",
+        8,
+      ),
+    ).toMatchObject({
       status: "idle",
       runningPromptId: undefined,
+      promptClaimId: undefined,
       updatedAt: 8,
     });
     expect(
       finishPrompt(
-        task({ status: "running", runningPromptId: "p1", pendingPermission: permission }),
+        task({
+          status: "running",
+          runningPromptId: "p1",
+          promptClaimId: "c1",
+          pendingPermission: permission,
+        }),
+        "c1",
         8,
       ).status,
     ).toBe("awaiting_permission");
+  });
+
+  it("keeps a claim that belongs to another turn", () => {
+    const current = task({ status: "running", runningPromptId: "p1", promptClaimId: "c1" });
+    expect(finishPrompt(current, "other", 8)).toBe(current);
   });
 
   it("sets and clears a pending permission", () => {
@@ -157,7 +179,8 @@ describe("lifecycle", () => {
       pendingPermission: undefined,
       updatedAt: 8,
     });
-    expect(resolvePermission({ ...pending, runningPromptId: "p" }, 8).status).toBe("running");
+    expect(resolvePermission({ ...pending, promptClaimId: "p" }, 8).status).toBe("running");
+    expect(resolvePermission({ ...pending, runningPromptId: "p" }, 8).status).toBe("idle");
   });
 });
 
@@ -573,10 +596,11 @@ describe("x.ai session notifications", () => {
         sessionId: "s1",
         update: { sessionUpdate: "turn_completed", usage: { totalTokens: 4 } },
       },
-      task({ status: "running", runningPromptId: "p1" }),
+      task({ status: "running", runningPromptId: "p1", promptClaimId: "c1" }),
     );
     expect(next.status).toBe("idle");
     expect(next.runningPromptId).toBeUndefined();
+    expect(next.promptClaimId).toBe("c1");
     expect(next.usage).toEqual({ totalTokens: 4 });
     expect(next.updatedAt).toBe(10);
   });
@@ -681,7 +705,7 @@ describe("x.ai session notifications", () => {
           sessionId: "s1",
           update: { sessionUpdate: "interaction_resolved", toolCallId: "t1" },
         },
-        task({ runningPromptId: "p" }),
+        task({ promptClaimId: "c1" }),
       ).status,
     ).toBe("running");
   });
@@ -712,18 +736,29 @@ describe("queue and turn state", () => {
     expect(running.queue).toEqual([{ id: "1", kind: "prompt", text: "hi" }]);
     expect(running.runningPromptId).toBe("1");
     expect(running.status).toBe("running");
+    expect(running.runningPromptId).toBe("1");
+    expect(running.promptClaimId).toBeUndefined();
     expect(
       notification({ kind: "queue_changed", sessionId: "s1", entries: [] }, running).status,
     ).toBe("idle");
   });
 
-  it("finishes a prompt", () => {
+  it("finishes a prompt only for the matching turn", () => {
+    const running = task({ status: "running", runningPromptId: "p", promptClaimId: "c1" });
     expect(
-      notification(
-        { kind: "prompt_complete", sessionId: "s1", promptId: "p" },
-        task({ status: "running", runningPromptId: "p" }),
-      ),
-    ).toMatchObject({ status: "idle", runningPromptId: undefined });
+      notification({ kind: "prompt_complete", sessionId: "s1", promptId: "p" }, running),
+    ).toMatchObject({
+      status: "idle",
+      runningPromptId: undefined,
+      promptClaimId: undefined,
+    });
+    expect(
+      notification({ kind: "prompt_complete", sessionId: "s1", promptId: "other" }, running),
+    ).toBe(running);
+    expect(notification({ kind: "prompt_complete", sessionId: "s1" }, running)).toMatchObject({
+      status: "idle",
+      promptClaimId: undefined,
+    });
   });
 
   it("ignores task-independent notifications", () => {

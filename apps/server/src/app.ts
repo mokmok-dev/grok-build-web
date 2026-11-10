@@ -41,6 +41,7 @@ export const appLayer = (
   const background = Layer.effectDiscard(
     Effect.gen(function* () {
       const client = yield* AcpClient;
+      yield* Effect.addFinalizer(() => client.disconnect);
       yield* Effect.forkScoped(client.connect);
       yield* startRequestHandler(config);
     }),

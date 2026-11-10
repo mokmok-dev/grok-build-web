@@ -1,5 +1,7 @@
 import { isWithin, resolveCandidate } from "@grok-build-web/acp-client";
+import { Effect } from "effect";
 import { resolve } from "node:path";
+import { realpathOfExistingAncestor } from "./realpath.ts";
 
 export const isUsableRoot = (root: string): boolean => root !== "/";
 
@@ -9,23 +11,29 @@ export interface PathPolicy {
   readonly allowedRoots: readonly string[];
 }
 
-/** Task working directories must stay under the default cwd or an explicitly allowed root. */
-export const taskCwdAllowed = (cwd: string, policy: PathPolicy): boolean => {
-  const resolved = resolveCandidate(cwd, policy.serverCwd);
-  if (!isUsableRoot(resolved)) return false;
-  return (
-    isWithin(resolved, policy.defaultCwd) ||
-    policy.allowedRoots.some((root) => isWithin(resolved, root))
-  );
-};
+const real = (path: string): Effect.Effect<string> =>
+  Effect.promise(() => realpathOfExistingAncestor(path));
 
-/** A terminal cwd may be the task cwd or any allowed root, never the filesystem root. */
-export const terminalCwdAllowed = (
+/** Task working directories must stay under the default cwd or an explicitly allowed root. */
+export const taskCwdAllowed = (cwd: string, policy: PathPolicy): Effect.Effect<boolean> =>
+  Effect.gen(function* () {
+    const candidate = yield* real(resolveCandidate(cwd, policy.serverCwd));
+    if (!isUsableRoot(candidate)) return false;
+    const defaultCwd = yield* real(policy.defaultCwd);
+    if (isWithin(candidate, defaultCwd)) return true;
+    const roots = yield* Effect.forEach(policy.allowedRoots, real);
+    return roots.some((root) => isWithin(candidate, root));
+  });
+
+/** Resolves a terminal cwd against the task cwd, returning the realpath only when it is in bounds. */
+export const resolveTerminalCwd = (
   cwd: string,
   taskCwd: string,
   allowedRoots: readonly string[],
-): boolean => {
-  const resolved = resolve(cwd);
-  if (!isUsableRoot(resolved)) return false;
-  return [taskCwd, ...allowedRoots].some((root) => isWithin(resolved, root));
-};
+): Effect.Effect<string | undefined> =>
+  Effect.gen(function* () {
+    const candidate = yield* real(resolve(taskCwd, cwd));
+    if (!isUsableRoot(candidate)) return undefined;
+    const roots = yield* Effect.forEach([taskCwd, ...allowedRoots], real);
+    return roots.some((root) => isWithin(candidate, root)) ? candidate : undefined;
+  });

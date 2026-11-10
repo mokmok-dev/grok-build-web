@@ -43,20 +43,35 @@ describe("Dialog", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("moves focus inside and restores it on close", async () => {
+  it("moves focus inside on open", () => {
+    render(<Harness onClose={() => undefined} />);
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
+  it("restores focus to the previous element after closing", async () => {
     const user = userEvent.setup();
     const trigger = document.createElement("button");
+    trigger.textContent = "Trigger";
     document.body.append(trigger);
     trigger.focus();
 
-    const { unmount } = render(<Harness onClose={() => undefined} />);
-    expect(document.activeElement?.textContent).not.toBe("Open dialog");
-
-    const inner = screen.getByRole("button", { name: "Inner" });
-    inner.focus();
+    render(<Harness onClose={() => undefined} />);
+    expect(screen.getByRole("dialog")).toBeTruthy();
     await user.keyboard("{Escape}");
-    unmount();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
     trigger.remove();
+  });
+
+  it("closes on a backdrop click", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    render(<Harness onClose={onClose} />);
+    const backdrop = document.querySelector(".dialog-backdrop");
+    if (backdrop === null) throw new Error("no backdrop");
+    await user.click(backdrop);
+    expect(onClose).toHaveBeenCalled();
   });
 
   it("traps Tab inside the dialog", async () => {

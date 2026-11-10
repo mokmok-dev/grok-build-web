@@ -66,6 +66,7 @@ export interface Task {
   readonly configOptions: readonly unknown[];
   readonly queue: readonly QueueEntry[];
   readonly runningPromptId?: string;
+  readonly promptClaimId?: string;
   readonly yolo: boolean;
 }
 
@@ -110,6 +111,7 @@ export const createTask = (input: CreateTaskInput): Task => ({
   configOptions: [],
   queue: [],
   runningPromptId: undefined,
+  promptClaimId: undefined,
   yolo: input.yolo ?? false,
 });
 
@@ -125,12 +127,18 @@ export const markClosed = (task: Task, now: number): Task =>
   touched(task, now, { status: "closed" });
 
 export const markError = (task: Task, message: string, now: number): Task =>
-  touched(task, now, { status: "error", lastError: message, runningPromptId: undefined });
+  touched(task, now, {
+    status: "error",
+    lastError: message,
+    runningPromptId: undefined,
+    promptClaimId: undefined,
+  });
 
 export const startPrompt = (task: Task, promptId: string, text: string, now: number): Task =>
   touched(task, now, {
     status: "running",
     runningPromptId: promptId,
+    promptClaimId: promptId,
     messages: [
       ...task.messages,
       {
@@ -142,11 +150,15 @@ export const startPrompt = (task: Task, promptId: string, text: string, now: num
     ],
   });
 
-export const finishPrompt = (task: Task, now: number): Task =>
-  touched(task, now, {
-    runningPromptId: undefined,
-    status: task.pendingPermission === undefined ? "idle" : "awaiting_permission",
-  });
+/** Releases the claim, but only for the turn that still owns it. */
+export const finishPrompt = (task: Task, claimId: string, now: number): Task =>
+  task.promptClaimId !== claimId
+    ? task
+    : touched(task, now, {
+        runningPromptId: undefined,
+        promptClaimId: undefined,
+        status: task.pendingPermission === undefined ? "idle" : "awaiting_permission",
+      });
 
 export const setPendingPermission = (
   task: Task,
@@ -161,7 +173,7 @@ export const setPendingPermission = (
 export const resolvePermission = (task: Task, now: number): Task =>
   touched(task, now, {
     pendingPermission: undefined,
-    status: task.runningPromptId === undefined ? "idle" : "running",
+    status: task.promptClaimId === undefined ? "idle" : "running",
   });
 
 export const mergeUsage = (base: Usage, patch: Usage | undefined): Usage => {
@@ -324,7 +336,7 @@ const applySessionNotification = (
         : task;
     case "interaction_resolved":
       return touched(task, now, {
-        status: task.runningPromptId === undefined ? "idle" : "running",
+        status: task.promptClaimId === undefined ? "idle" : "running",
       });
     case "session_summary_generated":
       return task;
@@ -355,7 +367,13 @@ export const applyNotification = (
     case "queue_changed":
       return applyQueueChanged(task, notification, now);
     case "prompt_complete":
-      return touched(task, now, { status: "idle", runningPromptId: undefined });
+      return notification.promptId !== undefined && notification.promptId !== task.runningPromptId
+        ? task
+        : touched(task, now, {
+            status: "idle",
+            runningPromptId: undefined,
+            promptClaimId: undefined,
+          });
     default:
       return task;
   }

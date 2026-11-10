@@ -195,6 +195,16 @@ export const App = () => {
     return () => clearTimeout(timer);
   }, [selectedId, selectedUpdatedAt, loadDetail]);
 
+  // Turns driven outside useChat only publish a few list snapshots, so poll the open task while it runs.
+  const running = selected?.status === "running";
+  useEffect(() => {
+    if (!running || selectedId === null) return;
+    const timer = setInterval(() => {
+      void loadDetail(selectedId);
+    }, 1_000);
+    return () => clearInterval(timer);
+  }, [running, selectedId, loadDetail]);
+
   useEffect(() => {
     if (!mobile) return;
     if (!mountedRef.current) {

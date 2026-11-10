@@ -7,10 +7,13 @@ import { HttpRouter, HttpServerResponse, type HttpServerRequest } from "effect/h
 import { chatSse, sseFrame } from "./chat.ts";
 import { redactUrl, Settings, type ServerConfig, type SettingsState } from "./config.ts";
 import { FsBridge } from "./fs-bridge.ts";
-import { taskCwdAllowed, terminalCwdAllowed } from "./paths.ts";
+import { resolveTerminalCwd, taskCwdAllowed } from "./paths.ts";
 import { checkRequest, readJsonBody, requestGuardPolicy } from "./security.ts";
 import { TaskRegistry } from "./tasks.ts";
 import { TerminalRegistry } from "./terminal.ts";
+
+// Bounded fan-out: a parked wait_for_exit must not serialize the queue, but the queue must stay finite.
+const REQUEST_CONCURRENCY = 32;
 
 type Response = HttpServerResponse.HttpServerResponse;
 type Handler = (
@@ -77,10 +80,11 @@ export const requestHandler = (
         return yield* reply(
           Effect.gen(function* () {
             const task = yield* session();
-            const cwd = request.cwd ?? task.cwd;
-            if (!terminalCwdAllowed(cwd, task.cwd, config.allowedRoots)) {
+            const requested = request.cwd ?? task.cwd;
+            const cwd = yield* resolveTerminalCwd(requested, task.cwd, config.allowedRoots);
+            if (cwd === undefined) {
               return yield* new AcpError({
-                message: `Working directory is outside the allowed roots: ${cwd}`,
+                message: `Working directory is outside the allowed roots: ${requested}`,
               });
             }
             return yield* terminals.create(task.id, {
@@ -147,7 +151,7 @@ export const startRequestHandler = (
       client.incomingRequests.pipe(
         Stream.mapEffect(
           (incoming) => requestHandler(incoming, config).pipe(Effect.catchCause(() => Effect.void)),
-          { concurrency: "unbounded" },
+          { concurrency: REQUEST_CONCURRENCY },
         ),
         Stream.runDrain,
       ),
@@ -197,6 +201,17 @@ export const routes = (
 
       const bodyOf = (request: HttpServerRequest.HttpServerRequest) =>
         readJsonBody(request, config.maxBodyBytes);
+
+      const respond = <A>(
+        effect: Effect.Effect<A, AcpError>,
+        toBody: (value: A) => unknown,
+      ): Effect.Effect<Response> =>
+        effect.pipe(
+          Effect.map((value) => json(toBody(value))),
+          Effect.catchTag("AcpError", (error) =>
+            Effect.succeed(json({ error: error.message }, 400)),
+          ),
+        );
 
       const readOnlyResponse = (): Response | undefined =>
         config.readOnly
@@ -307,22 +322,18 @@ export const routes = (
             const record = asRecord(body.value) ?? {};
             const current = yield* settings.get;
             const cwd = asString(record["cwd"]) ?? current.defaultCwd;
-            if (!taskCwdAllowed(cwd, pathPolicy(current))) {
+            if (!(yield* taskCwdAllowed(cwd, pathPolicy(current)))) {
               return json({ error: `Working directory is outside the allowed roots: ${cwd}` }, 400);
             }
-            return yield* registry
-              .create({
+            return yield* respond(
+              registry.create({
                 cwd,
                 prompt: asString(record["prompt"]),
                 model: asString(record["model"]) ?? current.defaultModel,
                 yolo: record["yolo"] === true,
-              })
-              .pipe(
-                Effect.map((task) => json(toDetail(task))),
-                Effect.catchTag("AcpError", (error) =>
-                  Effect.succeed(json({ error: error.message }, 400)),
-                ),
-              );
+              }),
+              toDetail,
+            );
           }),
         ),
       );
@@ -353,11 +364,9 @@ export const routes = (
             if (!body.ok) return json({ error: body.message }, body.status);
             const record = asRecord(body.value) ?? {};
             const text = asString(record["text"]) ?? "";
-            return yield* registry.prompt(id, text).pipe(
-              Effect.as(json({ accepted: true })),
-              Effect.catchTag("AcpError", (error) =>
-                Effect.succeed(json({ error: error.message }, 400)),
-              ),
+            return yield* respond(
+              registry.prompt(id, text).pipe(Effect.as({ accepted: true })),
+              (body) => body,
             );
           }),
         ),
@@ -369,11 +378,9 @@ export const routes = (
         guarded(() =>
           Effect.gen(function* () {
             const id = yield* taskId;
-            return yield* registry.cancel(id).pipe(
-              Effect.as(json({ accepted: true })),
-              Effect.catchTag("AcpError", (error) =>
-                Effect.succeed(json({ error: error.message }, 400)),
-              ),
+            return yield* respond(
+              registry.cancel(id).pipe(Effect.as({ accepted: true })),
+              (body) => body,
             );
           }),
         ),
@@ -387,11 +394,9 @@ export const routes = (
             const id = yield* taskId;
             const task = yield* registry.get(id);
             if (task === undefined) return json({ error: "Task not found" }, 404);
-            return yield* registry.close(id).pipe(
-              Effect.as(json({ closed: true })),
-              Effect.catchTag("AcpError", (error) =>
-                Effect.succeed(json({ error: error.message }, 400)),
-              ),
+            return yield* respond(
+              registry.close(id).pipe(Effect.as({ closed: true })),
+              (body) => body,
             );
           }),
         ),
@@ -416,11 +421,11 @@ export const routes = (
                   : { optionId };
             if (decision === undefined)
               return json({ error: "Expected optionId or decision" }, 400);
-            return yield* registry.respondPermission(id, requestId, decision).pipe(
-              Effect.as(json({ accepted: true })),
-              Effect.catchTag("AcpError", (error) =>
-                Effect.succeed(json({ error: error.message }, 400)),
-              ),
+            return yield* respond(
+              registry
+                .respondPermission(id, requestId, decision)
+                .pipe(Effect.as({ accepted: true })),
+              (body) => body,
             );
           }),
         ),

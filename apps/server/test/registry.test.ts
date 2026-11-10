@@ -236,6 +236,39 @@ describe("TaskRegistry", () => {
     );
   });
 
+  it("applies session changes and ignores model updates", async () => {
+    const notifications = await Effect.runPromise(PubSub.unbounded<ServerNotification>());
+    const { client } = stubClient({
+      request: () => Effect.succeed(sessionNew),
+      notifications: Stream.fromPubSub(notifications),
+    });
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const registry = yield* makeTaskRegistry(registryOptions);
+        yield* registry.create({ cwd: "/tmp", yolo: false });
+        yield* PubSub.publish(notifications, {
+          kind: "sessions_changed",
+          upserted: [
+            {
+              sessionId: "s1",
+              title: "Renamed",
+              activity: "idle",
+            },
+          ],
+          removed: [],
+        });
+        const renamed = yield* waitForTaskEffect(registry, (task) => task.title === "Renamed");
+        const before = yield* registry.get("s1");
+        yield* PubSub.publish(notifications, { kind: "models_update", availableModels: [] });
+        yield* Effect.sleep(20);
+        const after = yield* registry.get("s1");
+        return { renamed, before, after };
+      }).pipe(Effect.provideService(AcpClient, client), Effect.scoped),
+    );
+    expect(result.renamed.title).toBe("Renamed");
+    expect(result.after).toBe(result.before);
+  });
+
   it("publishes only meaningful list changes", async () => {
     const notifications = await Effect.runPromise(PubSub.unbounded<ServerNotification>());
     const { client } = stubClient({
@@ -286,7 +319,12 @@ describe("TaskRegistry", () => {
 
 const waitForTaskEffect = (
   registry: TaskRegistryShape,
-  predicate: (task: { status: string; runningPromptId?: string }) => boolean,
+  predicate: (task: {
+    status: string;
+    runningPromptId?: string;
+    lastError?: string;
+    title?: string;
+  }) => boolean,
 ) =>
   Effect.gen(function* () {
     const started = Date.now();
@@ -341,6 +379,24 @@ describe("Settings", () => {
     expect(result.third.ok && result.third.state.secret).toBeUndefined();
     const reconfigures = result.calls.filter((call) => call.method === "reconfigure");
     expect(reconfigures.map((call) => call.params)).toEqual(["ws://new/ws", "ws://new/ws"]);
+  });
+
+  it("keeps the default cwd inside the allowed roots", async () => {
+    const restricted = loadConfig({
+      GROK_WEB_DEFAULT_CWD: "/work",
+      GROK_WEB_ALLOWED_ROOTS: "/work",
+    });
+    const stub = stubClient({});
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const settings = yield* makeSettings(restricted);
+        const outside = yield* settings.update({ defaultCwd: "/tmp" });
+        const inside = yield* settings.update({ defaultCwd: "/work/sub" });
+        return { outside, inside };
+      }).pipe(Effect.provideService(AcpClient, stub.client)),
+    );
+    expect(result.outside).toMatchObject({ ok: false });
+    expect(result.inside.ok).toBe(true);
   });
 
   it("rejects invalid urls and cwds without storing them", async () => {

@@ -186,6 +186,27 @@ describe("AcpClient", () => {
     expect(status.lastError).toBeDefined();
   });
 
+  it("sends notifications", async () => {
+    const server = await startFake({ onMessage: respondToInitialize });
+    await runClient({ url: server.url }, (client) =>
+      client.notify("session/cancel", { sessionId: "s1" }),
+    );
+    const frame = await server.waitFor(
+      (message) => message["method"] === "session/cancel",
+      "the cancel notification",
+    );
+    expect(frame["id"]).toBeUndefined();
+    expect(frame["params"]).toEqual({ sessionId: "s1" });
+  });
+
+  it("refuses notifications before connecting", async () => {
+    const server = await startFake({ onMessage: respondToInitialize });
+    const exit = await withoutConnect({ url: server.url }, (client) =>
+      client.notify("session/cancel", { sessionId: "s1" }).pipe(Effect.exit),
+    );
+    expect(failureText(exit)).toContain("not connected");
+  });
+
   it("refuses requests before connecting", async () => {
     const server = await startFake({ onMessage: respondToInitialize });
     const exit = await withoutConnect({ url: server.url }, (client) =>
@@ -199,13 +220,10 @@ describe("AcpClient", () => {
       onConnect: (socket) => {
         socket.send("not json at all");
         socket.send(JSON.stringify({ jsonrpc: "2.0", id: "text-id", result: {} }));
+        send(socket, { jsonrpc: "2.0", id: 9_999, result: { ignored: true } });
+        send(socket, { jsonrpc: "2.0", id: 9_999, error: { code: 1, message: "ignored" } });
       },
-      onMessage: (socket, message) => {
-        if (message["method"] === "ping") {
-          send(socket, { jsonrpc: "2.0", id: 9_999, result: { ignored: true } });
-        }
-        respondToInitialize(socket, message);
-      },
+      onMessage: respondToInitialize,
     });
     const result = await runClient({ url: server.url }, (client) =>
       client.request("initialize", {}),

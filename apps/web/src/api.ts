@@ -78,8 +78,6 @@ export const fetchTask = (id: string): Promise<TaskDetail> =>
   send<TaskDetail>("GET", `/api/tasks/${encodeURIComponent(id)}`);
 export const createTask = (body: CreateTaskBody): Promise<TaskDetail> =>
   send<TaskDetail>("POST", "/api/tasks", body);
-export const promptTask = (id: string, text: string): Promise<unknown> =>
-  send("POST", `/api/tasks/${encodeURIComponent(id)}/prompt`, { text });
 export const cancelTask = (id: string): Promise<unknown> =>
   send("POST", `/api/tasks/${encodeURIComponent(id)}/cancel`, {});
 export const closeTask = (id: string): Promise<unknown> =>
@@ -127,8 +125,6 @@ export const STATUS_LABELS: Record<TaskStatus, string> = {
   error: "Error",
   closed: "Closed",
 };
-
-export const statusLabel = (status: TaskStatus): string => STATUS_LABELS[status];
 
 export type Connection = "connected" | "reconnecting" | "disconnected";
 

@@ -6,8 +6,7 @@ import {
   writeTextFile,
 } from "@grok-build-web/acp-client";
 import { Context, Effect, Layer } from "effect";
-import { realpath } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { realpathOfExistingAncestor } from "./realpath.ts";
 
 export interface FsBridgeShape {
   readonly read: (
@@ -28,22 +27,6 @@ export interface FsBridgeOptions {
   readonly readOnly: boolean;
   readonly maxFileBytes: number;
 }
-
-/** Resolves every existing ancestor so a symlinked cwd or root compares as its target. */
-export const realpathOfExistingAncestor = async (path: string): Promise<string> => {
-  let current = path;
-  const tail: string[] = [];
-  for (;;) {
-    try {
-      return join(await realpath(current), ...tail.reverse());
-    } catch {
-      const parent = dirname(current);
-      if (parent === current) return path;
-      tail.push(basename(current));
-      current = parent;
-    }
-  }
-};
 
 export const makeFsBridge = (options: FsBridgeOptions): FsBridgeShape => {
   const guard = (cwd: string, candidate: string) =>
@@ -66,7 +49,7 @@ export const makeFsBridge = (options: FsBridgeOptions): FsBridgeShape => {
       Effect.gen(function* () {
         const target = yield* guard(cwd, path);
         return yield* Effect.tryPromise({
-          try: () => readTextFile(target, line, limit, { maxBytes: options.maxFileBytes }),
+          try: () => readTextFile(target, line, limit, options.maxFileBytes),
           catch: (cause) => new AcpError({ message: `Cannot read ${path}: ${String(cause)}` }),
         });
       }),
@@ -77,7 +60,7 @@ export const makeFsBridge = (options: FsBridgeOptions): FsBridgeShape => {
         }
         const target = yield* guard(cwd, path);
         yield* Effect.tryPromise({
-          try: () => writeTextFile(target, content, { maxBytes: options.maxFileBytes }),
+          try: () => writeTextFile(target, content, options.maxFileBytes),
           catch: (cause) => new AcpError({ message: `Cannot write ${path}: ${String(cause)}` }),
         });
       }),

@@ -12,7 +12,9 @@ type Frame = Record<string, unknown>;
 
 interface FakeOptions {
   readonly failPrompts?: boolean;
+  readonly failAfterUpdates?: boolean;
   readonly promptDelayMs?: number;
+  readonly holdPrompts?: boolean;
 }
 
 interface FakeAcp {
@@ -22,6 +24,7 @@ interface FakeAcp {
   readonly received: Frame[];
   readonly sendRequest: (id: number, method: string, params: unknown) => void;
   readonly sendNotification: (method: string, params: unknown) => void;
+  readonly releasePrompt: () => boolean;
   readonly waitForFrame: (predicate: (frame: Frame) => boolean, label: string) => Promise<Frame>;
   readonly close: () => Promise<void>;
 }
@@ -33,6 +36,7 @@ const startFakeAcp = async (options: FakeOptions = {}): Promise<FakeAcp> => {
   const received: Frame[] = [];
   const sockets: WebSocket[] = [];
   const waiters: { predicate: (frame: Frame) => boolean; resolve: (frame: Frame) => void }[] = [];
+  const heldPrompts: Array<() => void> = [];
   let sessions = 0;
 
   const write = (socket: WebSocket, value: unknown): void => {
@@ -98,7 +102,29 @@ const startFakeAcp = async (options: FakeOptions = {}): Promise<FakeAcp> => {
             failReply(socket, id, -32000, "model exploded");
             return;
           }
-          setTimeout(() => {
+          if (options.failAfterUpdates === true) {
+            notify("session/update", {
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "partial" },
+                messageId: "m1",
+              },
+            });
+            notify("session/update", {
+              sessionId,
+              update: {
+                sessionUpdate: "tool_call",
+                toolCallId: "t1",
+                title: "Run",
+                name: "shell",
+                status: "pending",
+              },
+            });
+            failReply(socket, id, -32000, "model exploded");
+            return;
+          }
+          const finish = (): void => {
             notify("session/update", {
               sessionId,
               update: {
@@ -113,7 +139,12 @@ const startFakeAcp = async (options: FakeOptions = {}): Promise<FakeAcp> => {
             });
             notify("_x.ai/session/prompt_complete", { sessionId, promptId: "p" });
             respond(socket, id, { stopReason: "end_turn", usage: { totalTokens: 3 } });
-          }, options.promptDelayMs ?? 20);
+          };
+          if (options.holdPrompts === true) {
+            heldPrompts.push(finish);
+            return;
+          }
+          setTimeout(finish, options.promptDelayMs ?? 20);
           return;
         }
         case "session/cancel":
@@ -144,6 +175,12 @@ const startFakeAcp = async (options: FakeOptions = {}): Promise<FakeAcp> => {
       write(socket, { jsonrpc: "2.0", id, method, params });
     },
     sendNotification: (method, params) => notify(method, params),
+    releasePrompt: () => {
+      const next = heldPrompts.shift();
+      if (next === undefined) return false;
+      next();
+      return true;
+    },
     waitForFrame: (predicate, label) => {
       const found = received.find(predicate);
       if (found !== undefined) return Promise.resolve(found);
@@ -341,7 +378,7 @@ describe("server", () => {
   });
 
   it("sends follow-up prompts, cancels with a notification and rejects concurrent prompts", async () => {
-    const harness = await startHarness({ promptDelayMs: 300 });
+    const harness = await startHarness({ holdPrompts: true });
     await connected(harness);
     const detail = await createTask(harness);
 
@@ -358,6 +395,11 @@ describe("server", () => {
       error: "A prompt is already running for this task",
     });
 
+    await harness.acp.waitForFrame(
+      (frame) => frame["method"] === "session/prompt",
+      "the held prompt",
+    );
+    harness.acp.releasePrompt();
     await waitFor(async () => {
       const current = await json<{ status: string }>(
         await call(harness.handler, "GET", `/api/tasks/${detail.id}`),
@@ -421,7 +463,7 @@ describe("server", () => {
   });
 
   it("cancels the turn when the browser aborts the stream", async () => {
-    const harness = await startHarness({ promptDelayMs: 5_000 });
+    const harness = await startHarness({ holdPrompts: true });
     await connected(harness);
     const detail = await createTask(harness);
     const response = await call(harness.handler, "POST", `/api/tasks/${detail.id}/chat`, {
@@ -439,6 +481,19 @@ describe("server", () => {
       "the cancel notification",
     );
     expect(cancel["params"]).toEqual({ sessionId: detail.id });
+
+    // The aborted turn must release its prompt claim.
+    await waitFor(async () => {
+      const task = await json<{ status: string }>(
+        await call(harness.handler, "GET", `/api/tasks/${detail.id}`),
+      );
+      return task.status === "idle" ? true : undefined;
+    });
+    const again = await call(harness.handler, "POST", `/api/tasks/${detail.id}/prompt`, {
+      text: "after abort",
+    });
+    expect(again.status).toBe(200);
+    harness.acp.releasePrompt();
   });
 
   it("sends an empty prompt when the run has no user message", async () => {
@@ -452,6 +507,50 @@ describe("server", () => {
     });
     await sseReader(response).readUntil((text) => text.includes("RUN_FINISHED"));
     expect(harness.acp.prompts).toEqual([""]);
+  });
+
+  it("closes open streams before RUN_ERROR", async () => {
+    const harness = await startHarness({ failAfterUpdates: true });
+    await connected(harness);
+    const detail = await createTask(harness);
+    const response = await call(harness.handler, "POST", `/api/tasks/${detail.id}/chat`, {
+      threadId: detail.id,
+      runId: "run-error",
+      messages: [{ id: "m1", role: "user", content: "hi" }],
+    });
+    const body = await sseReader(response).readUntil((text) => text.includes("RUN_ERROR"));
+    const frames = body.split("\n\n").filter((frame) => frame.startsWith("data: "));
+    const last = frames[frames.length - 1];
+    expect(last).toContain('"type":"RUN_ERROR"');
+    const ends = frames.map((frame) =>
+      frame.includes('"type":"TEXT_MESSAGE_END"')
+        ? "text"
+        : frame.includes('"type":"TOOL_CALL_END"')
+          ? "tool"
+          : undefined,
+    );
+    expect(ends).toContain("text");
+    expect(ends).toContain("tool");
+  });
+
+  it("times out a prompt that never settles", async () => {
+    const harness = await startHarness({
+      holdPrompts: true,
+      env: { GROK_WEB_PROMPT_TIMEOUT_MS: "50" },
+    });
+    await connected(harness);
+    const detail = await createTask(harness);
+    const accepted = await call(harness.handler, "POST", `/api/tasks/${detail.id}/prompt`, {
+      text: "slow",
+    });
+    expect(accepted.status).toBe(200);
+    const failed = await waitFor(async () => {
+      const task = await json<{ status: string; lastError?: string }>(
+        await call(harness.handler, "GET", `/api/tasks/${detail.id}`),
+      );
+      return task.status === "error" ? task : undefined;
+    });
+    expect(failed.lastError).toContain("timed out: session/prompt");
   });
 
   it("emits RUN_ERROR when the agent fails the prompt", async () => {
@@ -512,10 +611,42 @@ describe("server", () => {
     const second = await call(harness.handler, "GET", "/api/events");
     expect(second.status).toBe(429);
     await reader.cancel();
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const third = await call(harness.handler, "GET", "/api/events");
+    const third = await waitFor(async () => {
+      const response = await call(harness.handler, "GET", "/api/events");
+      await response.body?.cancel();
+      return response.status === 200 ? response : undefined;
+    });
     expect(third.status).toBe(200);
-    await third.body?.cancel();
+  });
+
+  it("rejects malformed bodies and unknown tasks on every route", async () => {
+    const harness = await startHarness();
+    await connected(harness);
+    const detail = await createTask(harness);
+
+    expect((await call(harness.handler, "POST", "/api/tasks/nope/close", {})).status).toBe(404);
+    expect(
+      (
+        await call(harness.handler, "POST", `/api/tasks/${detail.id}/permission`, {
+          requestId: "x",
+        })
+      ).status,
+    ).toBe(400);
+    const textPlain = await rawCall(harness.handler, "POST", `/api/tasks/${detail.id}/prompt`, {
+      body: "text",
+      headers: { "content-type": "text/plain" },
+    });
+    expect(textPlain.status).toBe(415);
+    const badJson = await rawCall(harness.handler, "POST", `/api/tasks/${detail.id}/prompt`, {
+      body: "{",
+      headers: { "content-type": "application/json" },
+    });
+    expect(badJson.status).toBe(400);
+    const chatNoJson = await rawCall(harness.handler, "POST", `/api/tasks/${detail.id}/chat`, {
+      body: "{}",
+      headers: { "content-type": "text/plain" },
+    });
+    expect(chatNoJson.status).toBe(415);
   });
 
   it("serves the agent capabilities and sends initialize parameters", async () => {
@@ -749,6 +880,43 @@ describe("server", () => {
     ).toMatchObject({ result: {} });
   });
 
+  it("does not serialize requests behind a pending wait_for_exit", async () => {
+    const harness = await startHarness();
+    await connected(harness);
+    const detail = await createTask(harness);
+
+    harness.acp.sendRequest(910, "terminal/create", {
+      sessionId: detail.id,
+      command: "sh",
+      args: ["-c", "sleep 30"],
+    });
+    const created = await harness.acp.waitForFrame((frame) => frame["id"] === 910, "the terminal");
+    const terminalId = (created["result"] as { terminalId: string }).terminalId;
+
+    harness.acp.sendRequest(911, "terminal/wait_for_exit", { sessionId: detail.id, terminalId });
+    harness.acp.sendRequest(912, "terminal/create", {
+      sessionId: detail.id,
+      command: "true",
+      args: [],
+    });
+
+    // The second create is answered while the wait for the first terminal is still pending.
+    const second = await harness.acp.waitForFrame(
+      (frame) => frame["id"] === 912 && frame["result"] !== undefined,
+      "the second terminal",
+    );
+    expect((second["result"] as { terminalId: string }).terminalId).toBeDefined();
+    expect(harness.acp.received.some((frame) => frame["id"] === 911)).toBe(false);
+
+    harness.acp.sendRequest(913, "terminal/kill", { sessionId: detail.id, terminalId });
+    const waited = await harness.acp.waitForFrame(
+      (frame) => frame["id"] === 911 && frame["result"] !== undefined,
+      "the exit status",
+    );
+    expect((waited["result"] as { signal?: string }).signal).toBe("SIGTERM");
+    harness.acp.sendRequest(914, "terminal/release", { sessionId: detail.id, terminalId });
+  });
+
   it("rejects a terminal cwd outside the task and roots", async () => {
     const harness = await startHarness();
     await connected(harness);
@@ -806,6 +974,68 @@ describe("server", () => {
     );
     expect(after.status).toBe("idle");
     expect(after.pendingPermission).toBeUndefined();
+  });
+
+  it("does not consume a permission addressed to the wrong task", async () => {
+    const harness = await startHarness();
+    await connected(harness);
+    const first = await createTask(harness);
+    const second = await createTask(harness);
+    harness.acp.sendRequest(505, "session/request_permission", {
+      sessionId: first.id,
+      toolCall: { toolCallId: "t1", title: "Run ls" },
+      options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+    });
+    await waitFor(async () => {
+      const task = await json<{ pendingPermission?: { requestId: string } }>(
+        await call(harness.handler, "GET", `/api/tasks/${first.id}`),
+      );
+      return task.pendingPermission?.requestId === "505" ? true : undefined;
+    });
+
+    const wrong = await call(harness.handler, "POST", `/api/tasks/${second.id}/permission`, {
+      requestId: "505",
+      optionId: "allow_once",
+    });
+    expect(wrong.status).toBe(400);
+    expect(harness.acp.received.some((frame) => frame["id"] === 505)).toBe(false);
+
+    const right = await call(harness.handler, "POST", `/api/tasks/${first.id}/permission`, {
+      requestId: "505",
+      optionId: "allow_once",
+    });
+    expect(await json(right)).toEqual({ accepted: true });
+    const reply = await harness.acp.waitForFrame((frame) => frame["id"] === 505, "the reply");
+    expect(reply["result"]).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
+  });
+
+  it("answers and times out a permission exactly once", async () => {
+    const harness = await startHarness({ env: { GROK_WEB_PERMISSION_TIMEOUT_MS: "100" } });
+    await connected(harness);
+    const detail = await createTask(harness);
+    harness.acp.sendRequest(506, "session/request_permission", {
+      sessionId: detail.id,
+      toolCall: { toolCallId: "t1", title: "Run ls" },
+      options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+    });
+    await waitFor(async () => {
+      const task = await json<{ pendingPermission?: { requestId: string } }>(
+        await call(harness.handler, "GET", `/api/tasks/${detail.id}`),
+      );
+      return task.pendingPermission?.requestId === "506" ? true : undefined;
+    });
+    const decided = await call(harness.handler, "POST", `/api/tasks/${detail.id}/permission`, {
+      requestId: "506",
+      optionId: "allow_once",
+    });
+    expect(await json(decided)).toEqual({ accepted: true });
+    await harness.acp.waitForFrame((frame) => frame["id"] === 506, "the reply");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const replies = harness.acp.received.filter((frame) => frame["id"] === 506);
+    expect(replies).toHaveLength(1);
+    expect(replies[0]?.["result"]).toEqual({
+      outcome: { outcome: "selected", optionId: "allow_once" },
+    });
   });
 
   it("denies permission and rejects unknown requests", async () => {

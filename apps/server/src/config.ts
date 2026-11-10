@@ -1,4 +1,4 @@
-import { AcpClient } from "@grok-build-web/acp-client";
+import { AcpClient, isWithin } from "@grok-build-web/acp-client";
 import { Context, Effect, Layer, Ref } from "effect";
 import { resolve } from "node:path";
 import { isUsableRoot } from "./paths.ts";
@@ -158,6 +158,16 @@ export const makeSettings = (
           return {
             ok: false,
             message: "The default working directory cannot be the filesystem root",
+          };
+        }
+        if (
+          config.allowedRoots.length > 0 &&
+          !isWithin(defaultCwd, config.serverCwd) &&
+          !config.allowedRoots.some((root) => isWithin(defaultCwd, root))
+        ) {
+          return {
+            ok: false,
+            message: "The default working directory is outside the allowed roots",
           };
         }
         const next: SettingsState = {
