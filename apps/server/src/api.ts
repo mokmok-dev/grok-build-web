@@ -5,9 +5,16 @@ import { toDetail, type Task } from "@grok-build-web/task-model";
 import { Effect, Layer, Ref, Scope, Stream } from "effect";
 import { HttpRouter, HttpServerResponse, type HttpServerRequest } from "effect/http";
 import { chatSse, sseFrame } from "./chat.ts";
-import { redactUrl, Settings, type ServerConfig, type SettingsState } from "./config.ts";
+import { redactUrl, type ServerConfig } from "./config.ts";
 import { FsBridge } from "./fs-bridge.ts";
-import { resolveTerminalCwd, taskCwdAllowed } from "./paths.ts";
+import {
+  listDirectories,
+  reachableRoots,
+  resolveDirectory,
+  resolveTaskCwd,
+  resolveTerminalCwd,
+} from "./paths.ts";
+import { ProjectRegistry } from "./projects.ts";
 import { checkRequest, readJsonBody, requestGuardPolicy } from "./security.ts";
 import { TaskRegistry } from "./tasks.ts";
 import { TerminalRegistry } from "./terminal.ts";
@@ -23,12 +30,15 @@ type Handler = (
 const json = (body: unknown, status = 200): Response =>
   HttpServerResponse.jsonUnsafe(body, { status });
 
-const settingsPayload = (state: SettingsState): unknown => ({
-  url: redactUrl(state.url),
-  hasSecret: state.secret !== undefined,
-  defaultCwd: state.defaultCwd,
-  defaultModel: state.defaultModel,
-  readOnly: state.readOnly,
+const settingsPayload = (config: ServerConfig): unknown => ({
+  url: redactUrl(config.acpUrl),
+  hasSecret: config.acpSecret !== undefined,
+  defaultCwd: config.defaultCwd,
+  roots: reachableRoots(config),
+  defaultModel: config.defaultModel,
+  readOnly: config.readOnly,
+  configFile: config.configFile,
+  configFileExists: config.configFileExists,
 });
 
 export const requestHandler = (
@@ -163,14 +173,14 @@ export const routes = (
 ): Layer.Layer<
   never,
   never,
-  HttpRouter.HttpRouter | AcpClient | Settings | TaskRegistry | FsBridge | TerminalRegistry
+  HttpRouter.HttpRouter | AcpClient | TaskRegistry | ProjectRegistry | FsBridge | TerminalRegistry
 > => {
   const policy = requestGuardPolicy(config);
   return HttpRouter.use((router) =>
     Effect.gen(function* () {
       const client = yield* AcpClient;
-      const settings = yield* Settings;
       const registry = yield* TaskRegistry;
+      const projectRegistry = yield* ProjectRegistry;
       const agentRef = yield* Ref.make<InitializeResult | undefined>(undefined);
       const sseClients = yield* Ref.make(0);
 
@@ -218,12 +228,6 @@ export const routes = (
           ? json({ error: "Read-only mode: tasks cannot be created or prompted" }, 403)
           : undefined;
 
-      const pathPolicy = (state: SettingsState) => ({
-        serverCwd: config.serverCwd,
-        defaultCwd: state.defaultCwd,
-        allowedRoots: config.allowedRoots,
-      });
-
       const taskId = Effect.map(HttpRouter.params, (params) => params["id"] ?? "");
 
       const openSseSlot = Ref.modify(sseClients, (open) =>
@@ -238,12 +242,11 @@ export const routes = (
         guarded(() =>
           Effect.gen(function* () {
             const status = yield* client.status;
-            const current = yield* settings.get;
             return json({
               ok: true,
               acp: {
                 connected: status.state === "connected",
-                url: redactUrl(current.url),
+                url: redactUrl(config.acpUrl),
                 lastError: status.lastError,
               },
             });
@@ -254,33 +257,7 @@ export const routes = (
       yield* router.add(
         "GET",
         "/api/settings",
-        guarded(() =>
-          Effect.gen(function* () {
-            return json(settingsPayload(yield* settings.get));
-          }),
-        ),
-      );
-
-      yield* router.add(
-        "PUT",
-        "/api/settings",
-        guarded((request) =>
-          Effect.gen(function* () {
-            const body = yield* bodyOf(request);
-            if (!body.ok) return json({ error: body.message }, body.status);
-            const record = asRecord(body.value);
-            if (record === undefined) return json({ error: "Expected a JSON object" }, 400);
-            const result = yield* settings.update({
-              url: asString(record["url"]),
-              secret: asString(record["secret"]),
-              defaultCwd: asString(record["defaultCwd"]),
-              defaultModel: asString(record["defaultModel"]),
-            });
-            return result.ok
-              ? json(settingsPayload(result.state))
-              : json({ error: result.message }, 400);
-          }),
-        ),
+        guarded(() => Effect.succeed(json(settingsPayload(config)))),
       );
 
       yield* router.add(
@@ -296,6 +273,62 @@ export const routes = (
               availableCommands: info?.availableCommands ?? [],
               capabilities: info?.agentCapabilities ?? {},
             });
+          }),
+        ),
+      );
+
+      yield* router.add(
+        "GET",
+        "/api/projects",
+        guarded(() =>
+          Effect.gen(function* () {
+            return json({ projects: yield* projectRegistry.list });
+          }),
+        ),
+      );
+
+      yield* router.add(
+        "POST",
+        "/api/projects",
+        guarded((request) =>
+          Effect.gen(function* () {
+            const body = yield* bodyOf(request);
+            if (!body.ok) return json({ error: body.message }, body.status);
+            const record = asRecord(body.value) ?? {};
+            const requested = asString(record["root"]);
+            if (requested === undefined) return json({ error: "Expected a project root" }, 400);
+            const root = yield* resolveDirectory(requested, config);
+            if (root === undefined) {
+              return json(
+                {
+                  error: `Project root is outside the allowed roots or not a directory: ${requested}`,
+                },
+                400,
+              );
+            }
+            const result = yield* projectRegistry.create({
+              name: asString(record["name"]),
+              root,
+            });
+            return result.ok ? json(result.project) : json({ error: result.message }, 400);
+          }),
+        ),
+      );
+
+      yield* router.add(
+        "GET",
+        "/api/fs/dirs",
+        guarded((request) =>
+          Effect.gen(function* () {
+            const requested = new URL(request.url, "http://localhost").searchParams.get("path");
+            const path = requested === null || requested === "" ? config.defaultCwd : requested;
+            const listing = yield* listDirectories(path, config);
+            return listing === undefined
+              ? json(
+                  { error: `Directory is outside the allowed roots or unreadable: ${path}` },
+                  400,
+                )
+              : json(listing);
           }),
         ),
       );
@@ -320,16 +353,21 @@ export const routes = (
             const body = yield* bodyOf(request);
             if (!body.ok) return json({ error: body.message }, body.status);
             const record = asRecord(body.value) ?? {};
-            const current = yield* settings.get;
-            const cwd = asString(record["cwd"]) ?? current.defaultCwd;
-            if (!(yield* taskCwdAllowed(cwd, pathPolicy(current)))) {
-              return json({ error: `Working directory is outside the allowed roots: ${cwd}` }, 400);
+            const requested = asString(record["cwd"]);
+            const requestedCwd =
+              requested === undefined || requested === "" ? config.defaultCwd : requested;
+            const cwd = yield* resolveTaskCwd(requestedCwd, config);
+            if (cwd === undefined) {
+              return json(
+                { error: `Working directory is outside the allowed roots: ${requestedCwd}` },
+                400,
+              );
             }
             return yield* respond(
               registry.create({
                 cwd,
                 prompt: asString(record["prompt"]),
-                model: asString(record["model"]) ?? current.defaultModel,
+                model: asString(record["model"]) ?? config.defaultModel,
                 yolo: record["yolo"] === true,
               }),
               toDetail,

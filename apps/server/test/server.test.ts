@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -318,16 +318,26 @@ interface Harness {
 const harnesses: Harness[] = [];
 
 const startHarness = async (
-  options: FakeOptions & { readonly env?: Record<string, string> } = {},
+  options: FakeOptions & {
+    readonly env?: Record<string, string>;
+    readonly configFile?: (cwd: string, acpUrl: string) => Record<string, unknown>;
+  } = {},
 ): Promise<Harness> => {
   const acp = await startFakeAcp(options);
   const cwd = await mkdtemp(join(tmpdir(), "grok-web-server-"));
-  const config: ServerConfig = loadConfig({
-    GROK_ACP_URL: acp.url,
-    GROK_ACP_SECRET: "testsecret",
-    GROK_WEB_DEFAULT_CWD: cwd,
-    ...options.env,
-  });
+  const configFile = join(cwd, "grok-build-web.config.json");
+  if (options.configFile !== undefined) {
+    await writeFile(configFile, JSON.stringify(options.configFile(cwd, acp.url)));
+  }
+  const config: ServerConfig = loadConfig(
+    {
+      GROK_ACP_URL: acp.url,
+      GROK_ACP_SECRET: "testsecret",
+      GROK_WEB_DEFAULT_CWD: cwd,
+      ...options.env,
+    },
+    cwd,
+  );
   const { handler, dispose } = HttpRouter.toWebHandler(appLayer(config), { disableLogger: true });
   const harness: Harness = { handler, dispose, acp, cwd };
   harnesses.push(harness);
@@ -394,12 +404,40 @@ describe("server", () => {
     expect(health.acp.connected).toBe(true);
     expect(health.acp.url).not.toContain("testsecret");
 
-    const settings = await json<{ hasSecret: boolean; defaultCwd: string; readOnly: boolean }>(
-      await call(harness.handler, "GET", "/api/settings"),
-    );
+    const settings = await json<{
+      hasSecret: boolean;
+      defaultCwd: string;
+      roots: string[];
+      readOnly: boolean;
+      configFile: string;
+      configFileExists: boolean;
+    }>(await call(harness.handler, "GET", "/api/settings"));
     expect(settings.hasSecret).toBe(true);
     expect(settings.defaultCwd).toBe(harness.cwd);
+    expect(settings.roots).toEqual([harness.cwd]);
     expect(settings.readOnly).toBe(false);
+    expect(settings.configFile).toBe(join(harness.cwd, "grok-build-web.config.json"));
+    expect(settings.configFileExists).toBe(false);
+  });
+
+  it("prefers config file values over the environment", async () => {
+    const harness = await startHarness({
+      env: { GROK_ACP_URL: "ws://127.0.0.1:1/ws", GROK_WEB_DEFAULT_MODEL: "env-model" },
+      configFile: (cwd, acpUrl) => ({
+        acpUrl,
+        defaultCwd: cwd,
+        defaultModel: "file-model",
+      }),
+    });
+    await connected(harness);
+    const settings = await json<{
+      defaultModel?: string;
+      configFile: string;
+      configFileExists: boolean;
+    }>(await call(harness.handler, "GET", "/api/settings"));
+    expect(settings.defaultModel).toBe("file-model");
+    expect(settings.configFile).toBe(join(harness.cwd, "grok-build-web.config.json"));
+    expect(settings.configFileExists).toBe(true);
   });
 
   it("creates a task, streams a prompt and closes it", async () => {
@@ -799,7 +837,7 @@ describe("server", () => {
     await reader.cancel();
   });
 
-  it("requires JSON on permission and settings and caps chat streams", async () => {
+  it("requires JSON on permission and caps chat streams", async () => {
     const harness = await startHarness({ env: { GROK_WEB_MAX_SSE_CLIENTS: "1" } });
     await connected(harness);
     const detail = await createTask(harness);
@@ -811,11 +849,6 @@ describe("server", () => {
       { body: "text", headers: { "content-type": "text/plain" } },
     );
     expect(permission.status).toBe(415);
-    const settings = await rawCall(harness.handler, "PUT", "/api/settings", {
-      body: "text",
-      headers: { "content-type": "text/plain" },
-    });
-    expect(settings.status).toBe(415);
 
     const events = await call(harness.handler, "GET", "/api/events");
     const reader = sseReader(events);
@@ -948,11 +981,14 @@ describe("server", () => {
   it("returns 413 for oversized bodies on the Node transport", async () => {
     const acp = await startFakeAcp();
     const cwd = await mkdtemp(join(tmpdir(), "grok-web-node-"));
-    const config = loadConfig({
-      GROK_ACP_URL: acp.url,
-      GROK_ACP_SECRET: "testsecret",
-      GROK_WEB_DEFAULT_CWD: cwd,
-    });
+    const config = loadConfig(
+      {
+        GROK_ACP_URL: acp.url,
+        GROK_ACP_SECRET: "testsecret",
+        GROK_WEB_DEFAULT_CWD: cwd,
+      },
+      cwd,
+    );
     const oversized = JSON.stringify({ cwd, padding: "x".repeat(300_000) });
     try {
       const plain = await withNodeServer(config, (port) =>
@@ -988,6 +1024,265 @@ describe("server", () => {
     await connected(harness);
     const created = await call(harness.handler, "POST", "/api/tasks", { cwd: root });
     expect(created.status).toBe(200);
+  });
+
+  it("creates and lists projects", async () => {
+    const harness = await startHarness();
+    const repo = join(harness.cwd, "repo");
+    await mkdir(repo);
+
+    const first = await json<{ id: string; name: string; root: string }>(
+      await call(harness.handler, "POST", "/api/projects", { root: repo }),
+    );
+    expect(first.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(first.name).toBe("repo");
+    expect(first.root).toBe(await realpath(repo));
+
+    const second = await json<{ id: string; name: string; root: string }>(
+      await call(harness.handler, "POST", "/api/projects", {
+        root: harness.cwd,
+        name: "  Home  ",
+      }),
+    );
+    expect(second.name).toBe("Home");
+    expect(second.root).toBe(await realpath(harness.cwd));
+
+    const listed = await json<{ projects: Array<{ id: string }> }>(
+      await call(harness.handler, "GET", "/api/projects"),
+    );
+    expect(listed.projects.map((project) => project.id)).toEqual([first.id, second.id]);
+  });
+
+  it("rejects duplicate, missing and out-of-bounds project roots", async () => {
+    const harness = await startHarness();
+    expect(
+      (await call(harness.handler, "POST", "/api/projects", { root: harness.cwd })).status,
+    ).toBe(200);
+
+    const duplicate = await call(harness.handler, "POST", "/api/projects", {
+      root: join(harness.cwd, "."),
+    });
+    expect(duplicate.status).toBe(400);
+    expect(await json<{ error: string }>(duplicate)).toMatchObject({
+      error: expect.stringContaining("already uses"),
+    });
+
+    const invalid = [
+      {},
+      { root: 42 },
+      { root: "/" },
+      { root: "/etc" },
+      { root: join(harness.cwd, "missing") },
+    ];
+    for (const body of invalid) {
+      expect((await call(harness.handler, "POST", "/api/projects", body)).status).toBe(400);
+    }
+
+    await writeFile(join(harness.cwd, "notes.txt"), "hello");
+    expect(
+      (
+        await call(harness.handler, "POST", "/api/projects", {
+          root: join(harness.cwd, "notes.txt"),
+        })
+      ).status,
+    ).toBe(400);
+  });
+
+  it("allows project creation in read-only mode", async () => {
+    const harness = await startHarness({ env: { GROK_WEB_READ_ONLY: "1" } });
+    const created = await call(harness.handler, "POST", "/api/projects", { root: harness.cwd });
+    expect(created.status).toBe(200);
+    expect((await call(harness.handler, "POST", "/api/tasks", {})).status).toBe(403);
+  });
+
+  it("refuses project roots and browse requests that follow a symlink outside the bounds", async () => {
+    const harness = await startHarness();
+    const outside = await mkdtemp(join(tmpdir(), "grok-web-outside-"));
+    await mkdir(join(outside, "target"));
+    await symlink(outside, join(harness.cwd, "escape"));
+
+    const listing = await json<{ entries: string[] }>(
+      await call(harness.handler, "GET", `/api/fs/dirs?path=${encodeURIComponent(harness.cwd)}`),
+    );
+    expect(listing.entries).not.toContain(join(await realpath(harness.cwd), "escape"));
+
+    for (const path of [join(harness.cwd, "escape"), join(harness.cwd, "escape", "target")]) {
+      expect(
+        (await call(harness.handler, "GET", `/api/fs/dirs?path=${encodeURIComponent(path)}`))
+          .status,
+      ).toBe(400);
+      expect((await call(harness.handler, "POST", "/api/projects", { root: path })).status).toBe(
+        400,
+      );
+    }
+  });
+
+  it("browses and creates projects under an allowed root outside the default cwd", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "grok-web-root-")));
+    await mkdir(join(root, "child"));
+    const harness = await startHarness({ env: { GROK_WEB_ALLOWED_ROOTS: root } });
+
+    const listing = await json<{
+      path: string;
+      entries: string[];
+    }>(await call(harness.handler, "GET", `/api/fs/dirs?path=${encodeURIComponent(root)}`));
+    expect(listing.path).toBe(root);
+    expect(listing.entries).toEqual([join(root, "child")]);
+
+    const created = await call(harness.handler, "POST", "/api/projects", { root });
+    expect(created.status).toBe(200);
+
+    const settings = await json<{ roots: string[] }>(
+      await call(harness.handler, "GET", "/api/settings"),
+    );
+    expect(settings.roots).toEqual([harness.cwd, root]);
+  });
+
+  it("caps project names at 80 code points and rejects blank names", async () => {
+    const harness = await startHarness();
+    for (const name of ["one", "two", "three", "four"]) await mkdir(join(harness.cwd, name));
+
+    const exact = await json<{ name: string }>(
+      await call(harness.handler, "POST", "/api/projects", {
+        root: join(harness.cwd, "one"),
+        name: "y".repeat(80),
+      }),
+    );
+    expect(exact.name).toBe("y".repeat(80));
+
+    const long = await json<{ name: string }>(
+      await call(harness.handler, "POST", "/api/projects", {
+        root: join(harness.cwd, "two"),
+        name: "x".repeat(81),
+      }),
+    );
+    expect(long.name).toBe("x".repeat(80));
+
+    const astral = await json<{ name: string }>(
+      await call(harness.handler, "POST", "/api/projects", {
+        root: join(harness.cwd, "three"),
+        name: "😀".repeat(81),
+      }),
+    );
+    expect(astral.name).toBe("😀".repeat(80));
+
+    const blank = await call(harness.handler, "POST", "/api/projects", {
+      root: join(harness.cwd, "four"),
+      name: "   ",
+    });
+    expect(blank.status).toBe(400);
+    expect(await json<{ error: string }>(blank)).toMatchObject({
+      error: expect.stringContaining("must not be empty"),
+    });
+  });
+
+  it("enforces the project limit", async () => {
+    const harness = await startHarness({ env: { GROK_WEB_MAX_PROJECTS: "1" } });
+    await mkdir(join(harness.cwd, "one"));
+    expect(
+      (await call(harness.handler, "POST", "/api/projects", { root: harness.cwd })).status,
+    ).toBe(200);
+    const second = await call(harness.handler, "POST", "/api/projects", {
+      root: join(harness.cwd, "one"),
+    });
+    expect(second.status).toBe(400);
+    expect(await json<{ error: string }>(second)).toMatchObject({
+      error: "Project limit reached (1)",
+    });
+  });
+
+  it("defaults the directory listing to the default cwd", async () => {
+    const harness = await startHarness();
+    const root = await realpath(harness.cwd);
+    for (const path of ["/api/fs/dirs", "/api/fs/dirs?path="]) {
+      expect((await json<{ path: string }>(await call(harness.handler, "GET", path))).path).toBe(
+        root,
+      );
+    }
+  });
+
+  it("stores the canonical task cwd", async () => {
+    const harness = await startHarness();
+    await connected(harness);
+    await mkdir(join(harness.cwd, "real"));
+    await symlink(join(harness.cwd, "real"), join(harness.cwd, "alias"));
+    const created = await json<{ cwd: string }>(
+      await call(harness.handler, "POST", "/api/tasks", { cwd: join(harness.cwd, "alias") }),
+    );
+    expect(created.cwd).toBe(await realpath(join(harness.cwd, "real")));
+  });
+
+  it("treats an empty task cwd as absent", async () => {
+    const harness = await startHarness({
+      configFile: (cwd) => ({ defaultCwd: join(cwd, "sub") }),
+    });
+    await mkdir(join(harness.cwd, "sub"));
+    await connected(harness);
+    const created = await json<{ cwd: string }>(
+      await call(harness.handler, "POST", "/api/tasks", { cwd: "" }),
+    );
+    expect(created.cwd).toBe(await realpath(join(harness.cwd, "sub")));
+  });
+
+  it("browses directories inside the bounds", async () => {
+    const harness = await startHarness();
+    const root = await realpath(harness.cwd);
+    await mkdir(join(harness.cwd, "beta"));
+    await mkdir(join(harness.cwd, "alpha"));
+    await mkdir(join(harness.cwd, ".hidden"));
+    await writeFile(join(harness.cwd, "notes.txt"), "hello");
+    await symlink(join(harness.cwd, "alpha"), join(harness.cwd, "link"));
+
+    const listing = await json<{
+      path: string;
+      entries: string[];
+    }>(await call(harness.handler, "GET", `/api/fs/dirs?path=${encodeURIComponent(harness.cwd)}`));
+    expect(listing.path).toBe(root);
+    expect(listing.entries).toEqual([join(root, "alpha"), join(root, "beta")]);
+
+    const relative = await json<{ path: string }>(
+      await call(harness.handler, "GET", "/api/fs/dirs?path=alpha"),
+    );
+    expect(relative.path).toBe(join(root, "alpha"));
+
+    const nested = await json<{ entries: string[] }>(
+      await call(harness.handler, "GET", `/api/fs/dirs?path=${encodeURIComponent(relative.path)}`),
+    );
+    expect(nested.entries).toEqual([]);
+  });
+
+  it("rejects missing, non-directory and out-of-bounds browse requests", async () => {
+    const harness = await startHarness();
+    await writeFile(join(harness.cwd, "notes.txt"), "hello");
+    const paths = [
+      "/",
+      "/etc",
+      "../../etc",
+      join(harness.cwd, "missing"),
+      join(harness.cwd, "notes.txt"),
+    ];
+    for (const path of paths) {
+      expect(
+        (await call(harness.handler, "GET", `/api/fs/dirs?path=${encodeURIComponent(path)}`))
+          .status,
+      ).toBe(400);
+    }
+  });
+
+  it("caps the directory listing and reports truncation", async () => {
+    const harness = await startHarness();
+    const root = join(harness.cwd, "many");
+    await mkdir(root);
+    await Promise.all(
+      Array.from({ length: 201 }, (_, index) =>
+        mkdir(join(root, `d${String(index).padStart(3, "0")}`)),
+      ),
+    );
+    const listing = await json<{ entries: unknown[]; truncated?: true }>(
+      await call(harness.handler, "GET", `/api/fs/dirs?path=${encodeURIComponent(root)}`),
+    );
+    expect(listing.entries).toHaveLength(200);
+    expect(listing.truncated).toBe(true);
   });
 
   it("refuses mutations in read-only mode", async () => {
@@ -1369,20 +1664,18 @@ describe("server", () => {
     expect(reply["result"]).toEqual({ outcome: { outcome: "cancelled" } });
   });
 
-  it("validates settings updates", async () => {
+  it("serves settings read-only and refuses updates", async () => {
     const harness = await startHarness();
     await connected(harness);
-    const invalid = await call(harness.handler, "PUT", "/api/settings", { url: "http://nope" });
-    expect(invalid.status).toBe(400);
-    const root = await call(harness.handler, "PUT", "/api/settings", { defaultCwd: "/" });
-    expect(root.status).toBe(400);
-    const badBody = await call(harness.handler, "PUT", "/api/settings", ["not", "an", "object"]);
-    expect(badBody.status).toBe(400);
 
-    const updated = await call(harness.handler, "PUT", "/api/settings", {
-      secret: "new-secret",
-      defaultModel: "model-x",
-    });
-    expect(await json(updated)).toMatchObject({ hasSecret: true, defaultModel: "model-x" });
+    const put = await call(harness.handler, "PUT", "/api/settings", { defaultModel: "model-x" });
+    expect(put.status).toBe(404);
+
+    const settings = await json<{ defaultModel?: string; hasSecret: boolean }>(
+      await call(harness.handler, "GET", "/api/settings"),
+    );
+    expect(settings.defaultModel).toBeUndefined();
+    expect(settings.hasSecret).toBe(true);
+    expect(JSON.stringify(settings)).not.toContain("testsecret");
   });
 });

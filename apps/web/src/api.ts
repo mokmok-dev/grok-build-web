@@ -22,13 +22,33 @@ export interface Settings {
   readonly url: string;
   readonly hasSecret: boolean;
   readonly defaultCwd: string;
+  readonly roots: readonly string[];
   readonly defaultModel?: string;
   readonly readOnly: boolean;
+  readonly configFile: string;
+  readonly configFileExists: boolean;
 }
 
 export interface ModelInfo {
   readonly modelId: string;
   readonly name?: string;
+}
+
+export interface Project {
+  readonly id: string;
+  readonly name: string;
+  readonly root: string;
+}
+
+export interface DirectoryListing {
+  readonly path: string;
+  readonly entries: readonly string[];
+  readonly truncated?: true;
+}
+
+export interface ProjectInput {
+  readonly name?: string;
+  readonly root: string;
 }
 
 export interface AgentInfo {
@@ -42,7 +62,7 @@ export interface AgentInfo {
 }
 
 export interface CreateTaskBody {
-  readonly cwd: string;
+  readonly cwd?: string;
   readonly prompt?: string;
   readonly model?: string;
   readonly yolo: boolean;
@@ -54,7 +74,7 @@ export interface PermissionDecision {
   readonly decision?: "cancel";
 }
 
-type Method = "GET" | "POST" | "PUT";
+type Method = "GET" | "POST";
 
 const send = async <A>(method: Method, path: string, body?: unknown): Promise<A> => {
   const response = await fetch(path, {
@@ -78,23 +98,29 @@ export const fetchTask = (id: string): Promise<TaskDetail> =>
   send<TaskDetail>("GET", `/api/tasks/${encodeURIComponent(id)}`);
 export const createTask = (body: CreateTaskBody): Promise<TaskDetail> =>
   send<TaskDetail>("POST", "/api/tasks", body);
+export const fetchProjects = (): Promise<readonly Project[]> =>
+  send<{ projects: readonly Project[] }>("GET", "/api/projects").then((body) => body.projects);
+export const createProject = (body: ProjectInput): Promise<Project> =>
+  send<Project>("POST", "/api/projects", body);
+export const fetchDirs = (path: string | null): Promise<DirectoryListing> =>
+  send<DirectoryListing>(
+    "GET",
+    path === null ? "/api/fs/dirs" : `/api/fs/dirs?path=${encodeURIComponent(path)}`,
+  );
 export const cancelTask = (id: string): Promise<unknown> =>
   send("POST", `/api/tasks/${encodeURIComponent(id)}/cancel`, {});
 export const closeTask = (id: string): Promise<unknown> =>
   send("POST", `/api/tasks/${encodeURIComponent(id)}/close`, {});
 export const respondPermission = (id: string, body: PermissionDecision): Promise<unknown> =>
   send("POST", `/api/tasks/${encodeURIComponent(id)}/permission`, body);
-export const saveSettings = (body: {
-  readonly url?: string;
-  readonly secret?: string;
-  readonly defaultCwd?: string;
-  readonly defaultModel?: string;
-}): Promise<Settings> => send<Settings>("PUT", "/api/settings", body);
 
 export const basename = (path: string): string => {
   const parts = path.split("/").filter((part) => part !== "");
   return parts[parts.length - 1] ?? path;
 };
+
+export const isWithinRoot = (path: string, root: string): boolean =>
+  path === root || path.startsWith(root.endsWith("/") ? root : `${root}/`);
 
 export const relativeTime = (timestamp: number, now: number): string => {
   const seconds = Math.max(0, Math.round((now - timestamp) / 1000));

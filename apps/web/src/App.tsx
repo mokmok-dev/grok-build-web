@@ -6,27 +6,31 @@ import {
   closeTask,
   CONNECTION_LABELS,
   connectionOf,
+  createProject,
   createTask,
   fetchAgent,
   fetchHealth,
+  fetchProjects,
   fetchSettings,
   fetchTask,
   fetchTasks,
   respondPermission,
-  saveSettings,
   toInitialMessages,
   type AgentInfo,
   type Health,
+  type Project,
+  type ProjectInput,
   type Settings,
   type TaskDetail,
 } from "./api.ts";
 import { Composer } from "./components/Composer.tsx";
 import { EmptyState } from "./components/EmptyState.tsx";
+import { NewProjectDialog } from "./components/NewProjectDialog.tsx";
 import { NewTaskDialog, type NewTaskInput } from "./components/NewTaskDialog.tsx";
 import { PermissionBanner, type PermissionDecision } from "./components/PermissionBanner.tsx";
-import { SettingsDialog, type SettingsInput } from "./components/SettingsDialog.tsx";
+import { ProjectList, projectFor, UNGROUPED } from "./components/ProjectList.tsx";
+import { SettingsDialog } from "./components/SettingsDialog.tsx";
 import { TaskHeader } from "./components/TaskHeader.tsx";
-import { TaskList } from "./components/TaskList.tsx";
 import { Transcript } from "./components/Transcript.tsx";
 
 const useMobile = (): boolean => {
@@ -118,6 +122,7 @@ const ChatPanel = ({
 
 export const App = () => {
   const [tasks, setTasks] = useState<readonly TaskSummary[]>([]);
+  const [projects, setProjects] = useState<readonly Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [health, setHealth] = useState<Health | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -126,8 +131,10 @@ export const App = () => {
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showNewTask, setShowNewTask] = useState(false);
+  const [showNewProject, setShowNewProject] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [expandedProjects, setExpandedProjects] = useState<Readonly<Record<string, boolean>>>({});
   const [now, setNow] = useState(() => Date.now());
   const mobile = useMobile();
 
@@ -166,6 +173,9 @@ export const App = () => {
     fetchAgent()
       .then(setAgent)
       .catch(() => setAgent(null));
+    fetchProjects()
+      .then(setProjects)
+      .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
 
     const clock = setInterval(() => setNow(Date.now()), 30_000);
     const poll = setInterval(() => {
@@ -243,16 +253,30 @@ export const App = () => {
   const connection = connectionOf(health);
   const connected = connection === "connected";
 
-  const handleCreate = (input: NewTaskInput): void => {
+  const handleCreate = async (input: NewTaskInput): Promise<void> => {
+    const created = await createTask(input);
+    setTasks((current) => [created, ...current.filter((task) => task.id !== created.id)]);
+    // Selection alone leaves a group the user collapsed closed, hiding the task the main pane just opened.
+    setExpandedProjects((current) => ({
+      ...current,
+      [projectFor(projects, created.cwd)?.id ?? UNGROUPED]: true,
+    }));
+    setSelectedId(created.id);
+    setDetail(created);
+    loadedIdRef.current = created.id;
     setShowNewTask(false);
-    createTask(input)
-      .then((created) => {
-        setTasks((current) => [created, ...current.filter((task) => task.id !== created.id)]);
-        setSelectedId(created.id);
-        setDetail(created);
-        loadedIdRef.current = created.id;
-      })
-      .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
+  };
+
+  const handleCreateProject = async (input: ProjectInput): Promise<void> => {
+    const created = await createProject(input);
+    setProjects((current) => [...current, created]);
+    setExpandedProjects((current) => ({ ...current, [created.id]: true }));
+    setShowNewProject(false);
+  };
+
+  const handleSelect = (id: string): void => {
+    setSelectedId(id);
+    setDrawerOpen(false);
   };
 
   const handlePermission = (
@@ -266,16 +290,6 @@ export const App = () => {
         : { requestId: permission.requestId, optionId: decision.optionId };
     respondPermission(taskId, body)
       .then(() => loadDetail(taskId))
-      .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
-  };
-
-  const handleSaveSettings = (input: SettingsInput): void => {
-    saveSettings(input)
-      .then((next) => {
-        setSettings(next);
-        setShowSettings(false);
-        void reloadHealth();
-      })
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
   };
 
@@ -312,6 +326,9 @@ export const App = () => {
             <button type="button" onClick={() => setShowNewTask(true)} disabled={!connected}>
               New task
             </button>
+            <button type="button" onClick={() => setShowNewProject(true)} disabled={!connected}>
+              New project
+            </button>
             <button type="button" onClick={() => setShowSettings(true)}>
               Settings
             </button>
@@ -320,14 +337,16 @@ export const App = () => {
         {loading ? (
           <p className="empty-note">Loading tasks…</p>
         ) : (
-          <TaskList
+          <ProjectList
+            projects={projects}
             tasks={tasks}
             selectedId={selectedId}
             now={now}
-            onSelect={(id) => {
-              setSelectedId(id);
-              setDrawerOpen(false);
-            }}
+            expanded={expandedProjects}
+            onToggle={(key, open) =>
+              setExpandedProjects((current) => ({ ...current, [key]: open }))
+            }
+            onSelect={handleSelect}
           />
         )}
       </aside>
@@ -348,7 +367,7 @@ export const App = () => {
             body={
               connected
                 ? "Pick a task from the list or create a new one."
-                : "Start grok agent serve, or check the URL and secret in Settings."
+                : "Start grok agent serve, or check the ACP URL and secret in the server's config file."
             }
             action={
               <button type="button" onClick={() => setShowSettings(true)}>
@@ -397,18 +416,24 @@ export const App = () => {
       {showNewTask ? (
         <NewTaskDialog
           defaultCwd={settings?.defaultCwd ?? ""}
+          projects={projects}
           models={agent?.models.availableModels ?? []}
           onClose={() => setShowNewTask(false)}
           onCreate={handleCreate}
         />
       ) : null}
 
-      {showSettings && settings !== null ? (
-        <SettingsDialog
-          settings={settings}
-          onClose={() => setShowSettings(false)}
-          onSave={handleSaveSettings}
+      {showNewProject ? (
+        <NewProjectDialog
+          defaultCwd={settings?.defaultCwd ?? null}
+          roots={settings?.roots ?? []}
+          onClose={() => setShowNewProject(false)}
+          onCreate={handleCreateProject}
         />
+      ) : null}
+
+      {showSettings && settings !== null ? (
+        <SettingsDialog settings={settings} onClose={() => setShowSettings(false)} />
       ) : null}
     </div>
   );

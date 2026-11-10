@@ -1,9 +1,9 @@
 import { useState } from "react";
-import type { ModelInfo } from "../api.ts";
+import { type ModelInfo, type Project } from "../api.ts";
 import { Dialog } from "./Dialog.tsx";
 
 export interface NewTaskInput {
-  readonly cwd: string;
+  readonly cwd?: string;
   readonly prompt?: string;
   readonly model?: string;
   readonly yolo: boolean;
@@ -11,19 +11,24 @@ export interface NewTaskInput {
 
 export const NewTaskDialog = ({
   defaultCwd,
+  projects,
   models,
   onClose,
   onCreate,
 }: {
   readonly defaultCwd: string;
+  readonly projects: readonly Project[];
   readonly models: readonly ModelInfo[];
   readonly onClose: () => void;
-  readonly onCreate: (input: NewTaskInput) => void;
+  readonly onCreate: (input: NewTaskInput) => Promise<void>;
 }) => {
-  const [cwd, setCwd] = useState(defaultCwd);
+  const [root, setRoot] = useState("");
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
   const [yolo, setYolo] = useState(false);
+  const [submitError, setSubmitError] = useState<string | undefined>(undefined);
+  const [submitting, setSubmitting] = useState(false);
+  const cwd = root === "" ? defaultCwd : root;
 
   return (
     <Dialog title="New task" onClose={onClose}>
@@ -31,18 +36,35 @@ export const NewTaskDialog = ({
         className="form"
         onSubmit={(event) => {
           event.preventDefault();
-          const trimmedCwd = cwd.trim();
+          if (submitting) return;
           const trimmedPrompt = prompt.trim();
+          setSubmitError(undefined);
+          setSubmitting(true);
+          // Sending no cwd leaves the choice to the server, which resolves its configured default.
           onCreate({
-            cwd: trimmedCwd === "" ? defaultCwd : trimmedCwd,
+            cwd: root === "" ? undefined : root,
             prompt: trimmedPrompt === "" ? undefined : trimmedPrompt,
             model: model === "" ? undefined : model,
             yolo,
-          });
+          })
+            .catch((cause: unknown) =>
+              setSubmitError(cause instanceof Error ? cause.message : String(cause)),
+            )
+            .finally(() => setSubmitting(false));
         }}
       >
-        <label htmlFor="new-cwd">Working directory</label>
-        <input id="new-cwd" value={cwd} onChange={(event) => setCwd(event.target.value)} />
+        <label htmlFor="new-project">Project</label>
+        <select id="new-project" value={root} onChange={(event) => setRoot(event.target.value)}>
+          <option value="">Default working directory</option>
+          {projects.map((project) => (
+            <option key={project.id} value={project.root}>
+              {project.name} — {project.root}
+            </option>
+          ))}
+        </select>
+        <p className="empty-note">
+          {cwd === "" ? "Server default working directory" : `Working directory: ${cwd}`}
+        </p>
 
         <label htmlFor="new-model">Model</label>
         <select id="new-model" value={model} onChange={(event) => setModel(event.target.value)}>
@@ -72,11 +94,19 @@ export const NewTaskDialog = ({
           Yolo mode (auto-approve tool calls)
         </label>
 
+        {submitError === undefined ? null : (
+          <p className="error" role="status">
+            {submitError}
+          </p>
+        )}
+
         <div className="form-actions">
           <button type="button" className="secondary" onClick={onClose}>
             Cancel
           </button>
-          <button type="submit">Create task</button>
+          <button type="submit" disabled={submitting}>
+            Create task
+          </button>
         </div>
       </form>
     </Dialog>

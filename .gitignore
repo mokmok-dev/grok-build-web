@@ -10,3 +10,4 @@
 /result
 /result-*
 **/stryker.log
+**/grok-build-web.config.json

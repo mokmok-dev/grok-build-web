@@ -14,7 +14,13 @@ import {
   resolveRoots,
 } from "../src/config.ts";
 import { fsBridgeLayer, FsBridge, type FsBridgeShape } from "../src/fs-bridge.ts";
-import { resolveRealPath, resolveTerminalCwd, taskCwdAllowed } from "../src/paths.ts";
+import {
+  reachableRoots,
+  resolveRealPath,
+  resolveTaskCwd,
+  resolveTerminalCwd,
+} from "../src/paths.ts";
+import { makeProjectRegistry } from "../src/projects.ts";
 import { realpathOfExistingAncestor } from "../src/realpath.ts";
 import { checkRequest, readJsonBody, requestGuardPolicy } from "../src/security.ts";
 import { makeTerminalRegistry } from "../src/terminal.ts";
@@ -43,8 +49,9 @@ const webRequest = (body: string, headers: Record<string, string>): Request =>
   new Request("http://127.0.0.1/api", { method: "POST", headers, body });
 
 describe("loadConfig", () => {
-  it("applies defaults and resolves roots", () => {
-    const config = loadConfig({});
+  it("applies defaults and resolves roots", async () => {
+    const root = await dir();
+    const config = loadConfig({}, root);
     expect(config.acpUrl).toBe("ws://127.0.0.1:2419/ws");
     expect(config.acpSecret).toBeUndefined();
     expect(config.port).toBe(3000);
@@ -54,6 +61,7 @@ describe("loadConfig", () => {
     expect(config.maxTerminals).toBe(8);
     expect(config.terminalOutputLimit).toBe(1_048_576);
     expect(config.maxTasks).toBe(100);
+    expect(config.maxProjects).toBe(50);
     expect(config.maxFileBytes).toBe(2_097_152);
     expect(config.maxBodyBytes).toBe(262_144);
     expect(config.promptTimeoutMs).toBe(1_800_000);
@@ -61,8 +69,10 @@ describe("loadConfig", () => {
     expect(config.eventsHeartbeatMs).toBe(15_000);
     expect(config.allowedOrigins).toEqual([]);
     expect(config.allowedHosts).toEqual([]);
-    expect(config.defaultCwd).toBe(process.cwd());
+    expect(config.defaultCwd).toBe(root);
     expect(config.defaultModel).toBeUndefined();
+    expect(config.configFile).toBe(join(root, "grok-build-web.config.json"));
+    expect(config.configFileExists).toBe(false);
   });
 
   it("reads overrides, splits lists and drops the filesystem root", () => {
@@ -75,6 +85,7 @@ describe("loadConfig", () => {
       GROK_WEB_READ_ONLY: "1",
       GROK_WEB_MAX_TERMINALS: "2",
       GROK_WEB_MAX_TASKS: "3",
+      GROK_WEB_MAX_PROJECTS: "4",
       GROK_WEB_TERMINAL_OUTPUT_LIMIT: "10",
       GROK_WEB_DEFAULT_CWD: "/work",
       GROK_WEB_DEFAULT_MODEL: "m",
@@ -90,6 +101,7 @@ describe("loadConfig", () => {
       readOnly: true,
       maxTerminals: 2,
       maxTasks: 3,
+      maxProjects: 4,
       terminalOutputLimit: 10,
       defaultCwd: "/work",
       defaultModel: "m",
@@ -98,13 +110,22 @@ describe("loadConfig", () => {
     });
   });
 
-  it("prefers GROK_ACP_SECRET and ignores empty values", () => {
-    expect(loadConfig({ GROK_ACP_SECRET: "a", GROK_AGENT_SECRET: "b" }).acpSecret).toBe("a");
-    expect(loadConfig({ GROK_ACP_SECRET: "" }).acpSecret).toBeUndefined();
+  it("prefers GROK_ACP_SECRET and ignores empty values", async () => {
+    const root = await dir();
+    expect(loadConfig({ GROK_ACP_SECRET: "a", GROK_AGENT_SECRET: "b" }, root).acpSecret).toBe("a");
+    expect(loadConfig({ GROK_ACP_SECRET: "" }, root).acpSecret).toBeUndefined();
+    expect(loadConfig({ GROK_ACP_URL: "" }, root).acpUrl).toBe("ws://127.0.0.1:2419/ws");
   });
 
-  it("falls back for an invalid port", () => {
-    expect(loadConfig({ PORT: "nope" }).port).toBe(3000);
+  it("rejects an environment ACP URL that is not ws or wss", async () => {
+    const root = await dir();
+    expect(() => loadConfig({ GROK_ACP_URL: "http://nope" }, root)).toThrow(
+      /Invalid GROK_ACP_URL: must be a ws:\/\/ or wss:\/\/ URL/,
+    );
+  });
+
+  it("falls back for an invalid port", async () => {
+    expect(loadConfig({ PORT: "nope" }, await dir()).port).toBe(3000);
   });
 
   it("resolves relative roots against the server cwd", () => {
@@ -112,6 +133,126 @@ describe("loadConfig", () => {
     expect(resolveRoots("/", "/work")).toEqual([]);
     expect(resolveDefaultCwd("/", "/work")).toBe("/work");
     expect(resolveDefaultCwd("sub", "/work")).toBe("/work/sub");
+  });
+});
+
+describe("config file", () => {
+  const write = async (content: unknown): Promise<{ root: string; file: string }> => {
+    const root = await dir();
+    const file = join(root, "grok-build-web.config.json");
+    await writeFile(file, typeof content === "string" ? content : JSON.stringify(content));
+    return { root, file };
+  };
+
+  it("reads the default path and prefers file values over the environment", async () => {
+    const { root, file } = await write({
+      acpUrl: "wss://file.example/ws",
+      acpSecret: "file-secret",
+      defaultCwd: "work",
+      defaultModel: "file-model",
+    });
+    const config = loadConfig(
+      {
+        GROK_ACP_URL: "ws://env.example/ws",
+        GROK_ACP_SECRET: "env-secret",
+        GROK_WEB_DEFAULT_CWD: "/env",
+        GROK_WEB_DEFAULT_MODEL: "env-model",
+      },
+      root,
+    );
+    expect(config.configFile).toBe(file);
+    expect(config).toMatchObject({
+      acpUrl: "wss://file.example/ws",
+      acpSecret: "file-secret",
+      defaultCwd: join(root, "work"),
+      defaultModel: "file-model",
+    });
+  });
+
+  it("honours GROK_WEB_CONFIG and keeps the environment for missing fields", async () => {
+    const { root } = await write({ defaultModel: "file-model" });
+    const custom = join(root, "custom.json");
+    await writeFile(custom, JSON.stringify({ defaultModel: "custom-model" }));
+    const config = loadConfig(
+      {
+        GROK_WEB_CONFIG: custom,
+        GROK_ACP_URL: "ws://env.example/ws",
+        GROK_WEB_DEFAULT_CWD: "env",
+      },
+      root,
+    );
+    expect(config.configFile).toBe(custom);
+    expect(config.configFileExists).toBe(true);
+    expect(config).toMatchObject({
+      acpUrl: "ws://env.example/ws",
+      defaultModel: "custom-model",
+      defaultCwd: join(root, "env"),
+    });
+    expect(loadConfig({ GROK_WEB_CONFIG: "custom.json" }, root).configFile).toBe(custom);
+  });
+
+  it("lets an empty file value clear the environment value", async () => {
+    const { root } = await write({
+      acpSecret: "",
+      defaultCwd: "",
+      defaultModel: "",
+    });
+    const config = loadConfig(
+      {
+        GROK_ACP_SECRET: "env-secret",
+        GROK_WEB_DEFAULT_CWD: "/env",
+        GROK_WEB_DEFAULT_MODEL: "env-model",
+      },
+      root,
+    );
+    expect(config.acpSecret).toBeUndefined();
+    expect(config.defaultCwd).toBe(root);
+    expect(config.defaultModel).toBeUndefined();
+  });
+
+  it("treats an empty GROK_WEB_CONFIG as unset", async () => {
+    const root = await dir();
+    const config = loadConfig({ GROK_WEB_CONFIG: "" }, root);
+    expect(config.configFile).toBe(join(root, "grok-build-web.config.json"));
+    expect(config.configFileExists).toBe(false);
+  });
+
+  it("is optional", async () => {
+    const root = await dir();
+    const config = loadConfig({}, root);
+    expect(config.configFile).toBe(join(root, "grok-build-web.config.json"));
+    expect(config.configFileExists).toBe(false);
+  });
+
+  it("stops on an explicitly named file that cannot be read", async () => {
+    const root = await dir();
+    const missing = join(root, "typo.json");
+    expect(() => loadConfig({ GROK_WEB_CONFIG: missing }, root)).toThrow(
+      `Cannot read config file ${missing}: ENOENT`,
+    );
+    expect(() => loadConfig({ GROK_WEB_CONFIG: root }, root)).toThrow(
+      `Cannot read config file ${root}:`,
+    );
+  });
+
+  it("rejects malformed and invalid content", async () => {
+    const cases: ReadonlyArray<readonly [unknown, RegExp]> = [
+      ["{", /Invalid config file .+:/],
+      ["[]", /expected a JSON object/],
+      [{ acpUrl: 42 }, /"acpUrl" must be a string/],
+      [{ acpUrl: "" }, /"acpUrl" must be a ws:\/\/ or wss:\/\/ URL/],
+      [{ acpUrl: "http://nope" }, /"acpUrl" must be a ws:\/\/ or wss:\/\/ URL/],
+      [{ acpSecret: null }, /"acpSecret" must be a string/],
+      [{ defaultCwd: false }, /"defaultCwd" must be a string/],
+      [{ defaultCwd: "/" }, /"defaultCwd" is not a usable directory/],
+      [{ defaultModel: 7 }, /"defaultModel" must be a string/],
+      [{ acpURL: "ws://host/ws" }, /unknown field\(s\) "acpURL"/],
+    ];
+    for (const [content, expected] of cases) {
+      const { root, file } = await write(content);
+      expect(() => loadConfig({}, root)).toThrow(file);
+      expect(() => loadConfig({}, root)).toThrow(expected);
+    }
   });
 });
 
@@ -260,22 +401,48 @@ describe("readJsonBody", () => {
 });
 
 describe("paths", () => {
-  it("allows the default cwd, its children and allowed roots", async () => {
+  it("resolves the default cwd, its children and allowed roots to real paths", async () => {
     const root = await dir();
     const extra = await dir();
     const policy = { serverCwd: root, defaultCwd: root, allowedRoots: [extra] };
-    expect(await Effect.runPromise(taskCwdAllowed(root, policy))).toBe(true);
-    expect(await Effect.runPromise(taskCwdAllowed("sub", policy))).toBe(true);
-    expect(await Effect.runPromise(taskCwdAllowed(extra, policy))).toBe(true);
+    expect(await Effect.runPromise(resolveTaskCwd(root, policy))).toBe(
+      await realpathOfExistingAncestor(root),
+    );
+    expect(await Effect.runPromise(resolveTaskCwd("sub", policy))).toBe(
+      await realpathOfExistingAncestor(join(root, "sub")),
+    );
+    expect(await Effect.runPromise(resolveTaskCwd(extra, policy))).toBe(
+      await realpathOfExistingAncestor(extra),
+    );
+  });
+
+  it("opens one anchored root per reachable bound", () => {
+    expect(
+      reachableRoots({
+        serverCwd: "/srv",
+        defaultCwd: "/srv/work",
+        allowedRoots: ["/data", "/srv/work/app", "/srv/work/app/nested"],
+      }),
+    ).toEqual(["/srv/work", "/data"]);
+    expect(
+      reachableRoots({ serverCwd: "/srv", defaultCwd: "/srv", allowedRoots: ["/srv"] }),
+    ).toEqual(["/srv"]);
+    expect(
+      reachableRoots({
+        serverCwd: "/srv/work",
+        defaultCwd: "/srv/work",
+        allowedRoots: ["/srv"],
+      }),
+    ).toEqual(["/srv"]);
   });
 
   it("rejects the filesystem root and unrelated paths", async () => {
     const root = await dir();
     const outside = await dir();
     const policy = { serverCwd: root, defaultCwd: root, allowedRoots: [] };
-    expect(await Effect.runPromise(taskCwdAllowed("/", policy))).toBe(false);
-    expect(await Effect.runPromise(taskCwdAllowed(outside, policy))).toBe(false);
-    expect(await Effect.runPromise(taskCwdAllowed("../../etc", policy))).toBe(false);
+    expect(await Effect.runPromise(resolveTaskCwd("/", policy))).toBeUndefined();
+    expect(await Effect.runPromise(resolveTaskCwd(outside, policy))).toBeUndefined();
+    expect(await Effect.runPromise(resolveTaskCwd("../../etc", policy))).toBeUndefined();
   });
 
   it("rejects a symlink that leaves the default cwd", async () => {
@@ -284,7 +451,7 @@ describe("paths", () => {
     const link = join(root, "escape");
     await symlink(outside, link);
     const policy = { serverCwd: root, defaultCwd: root, allowedRoots: [] };
-    expect(await Effect.runPromise(taskCwdAllowed(link, policy))).toBe(false);
+    expect(await Effect.runPromise(resolveTaskCwd(link, policy))).toBeUndefined();
   });
 
   it("resolves real paths and treats an empty root list as unbounded", async () => {
@@ -309,6 +476,59 @@ describe("paths", () => {
     );
     expect(await Effect.runPromise(resolveTerminalCwd("/", root, [extra]))).toBeUndefined();
     expect(await Effect.runPromise(resolveTerminalCwd("/etc", root, [extra]))).toBeUndefined();
+  });
+});
+
+describe("ProjectRegistry", () => {
+  const makeRegistry = (maxProjects = 50) =>
+    Effect.runPromise(makeProjectRegistry({ maxProjects }));
+
+  it("derives, trims and caps names by code point", async () => {
+    const projects = await makeRegistry();
+    expect(await Effect.runPromise(projects.create({ root: "/work/alpha" }))).toMatchObject({
+      ok: true,
+      project: { name: "alpha", root: "/work/alpha" },
+    });
+    expect(
+      await Effect.runPromise(projects.create({ root: "/work/beta", name: "  Beta  " })),
+    ).toMatchObject({ ok: true, project: { name: "Beta" } });
+
+    const capped = await Effect.runPromise(
+      projects.create({ root: "/work/gamma", name: "😀".repeat(90) }),
+    );
+    if (!capped.ok) throw new Error("expected the name to be accepted");
+    expect(capped.project.name).toBe("😀".repeat(80));
+    expect([...capped.project.name]).toHaveLength(80);
+  });
+
+  it("rejects a blank name", async () => {
+    const projects = await makeRegistry();
+    expect(await Effect.runPromise(projects.create({ root: "/work/a", name: "   " }))).toEqual({
+      ok: false,
+      message: "Project name must not be empty",
+    });
+  });
+
+  it("keeps insertion order and rejects a duplicate root", async () => {
+    const projects = await makeRegistry();
+    const first = await Effect.runPromise(projects.create({ root: "/work/a" }));
+    await Effect.runPromise(projects.create({ root: "/work/b" }));
+    expect(await Effect.runPromise(projects.create({ root: "/work/a" }))).toEqual({
+      ok: false,
+      message: "A project already uses this directory: /work/a",
+    });
+    const listed = await Effect.runPromise(projects.list);
+    expect(listed.map((project) => project.root)).toEqual(["/work/a", "/work/b"]);
+    expect(listed[0]).toEqual(first.ok ? first.project : undefined);
+  });
+
+  it("rejects a project once the limit is reached", async () => {
+    const projects = await makeRegistry(1);
+    await Effect.runPromise(projects.create({ root: "/work/a" }));
+    expect(await Effect.runPromise(projects.create({ root: "/work/b" }))).toEqual({
+      ok: false,
+      message: "Project limit reached (1)",
+    });
   });
 });
 

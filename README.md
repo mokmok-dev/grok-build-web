@@ -47,9 +47,10 @@ to bind Vite to another interface. For HTTPS, keep Vite on loopback and run
 | `GROK_ACP_SECRET` / `GROK_AGENT_SECRET` | unset                    | value for the `server-key` query parameter                                        |
 | `PORT` / `HOST`                         | `3000` / `127.0.0.1`     | HTTP listen address                                                               |
 | `GROK_WEB_ALLOWED_ROOTS`                | empty                    | colon-separated extra roots for task cwds, files and terminals                    |
-| `GROK_WEB_DEFAULT_CWD`                  | `process.cwd()`          | default task working directory, also an allowed root                              |
+| `GROK_WEB_DEFAULT_CWD`                  | `process.cwd()`          | default working directory, and an allowed root                                    |
 | `GROK_WEB_READ_ONLY`                    | unset                    | `1` rejects task creation, prompts and chat, and disables fs writes and terminals |
 | `GROK_WEB_MAX_TASKS`                    | `100`                    | tasks tracked before creation is rejected                                         |
+| `GROK_WEB_MAX_PROJECTS`                 | `50`                     | projects tracked before creation is rejected                                      |
 | `GROK_WEB_MAX_TERMINALS`                | `8`                      | concurrent agent terminals                                                        |
 | `GROK_WEB_TERMINAL_OUTPUT_LIMIT`        | `1048576`                | bytes of output kept per terminal                                                 |
 | `GROK_WEB_MAX_FILE_BYTES`               | `2097152`                | largest file the agent may read or write                                          |
@@ -61,13 +62,68 @@ to bind Vite to another interface. For HTTPS, keep Vite on loopback and run
 | `GROK_WEB_ALLOWED_ORIGINS`              | empty                    | comma-separated extra browser origins                                             |
 | `GROK_WEB_ALLOWED_HOSTS`                | empty                    | comma-separated extra `Host` names (needed behind a proxy)                        |
 | `GROK_WEB_DEFAULT_MODEL`                | unset                    | default model for new tasks                                                       |
+| `GROK_WEB_CONFIG`                       | see below                | JSON config file path                                                             |
 
-Roots are resolved once against the server working directory; `/` is never accepted as a root or as a
-task cwd. The web UI's _Settings_ dialog can change the URL, secret, default cwd and default model at
-runtime; the server validates them and reconnects only when the URL or secret changes.
+Roots are resolved once against the server working directory; `/` is never accepted as a root, a
+task cwd or a project root. `GROK_ACP_URL`, `GROK_ACP_SECRET`, `GROK_WEB_DEFAULT_CWD` and
+`GROK_WEB_DEFAULT_MODEL` are fallbacks for the matching config file entries.
+
+## Configuration file
+
+The ACP WebSocket URL, the ACP secret, the default working directory and the default model are read
+from a JSON config file at startup. `GROK_WEB_CONFIG` sets the path; otherwise the server reads
+`<server cwd>/grok-build-web.config.json`. A relative path resolves against the server working
+directory, which is `apps/server` under `pnpm dev`. The default file is optional; a file named by
+`GROK_WEB_CONFIG` must exist, because a typo there would otherwise start the server without the
+secret it was meant to use.
+
+A present key wins over the matching environment variable, and an empty string is a value: setting a
+key to `""` clears the environment fallback, so `"acpSecret": ""` leaves no secret. An empty
+`acpUrl` is still an error, and an empty `defaultCwd` resolves to the server working directory.
+
+```json
+{
+  "acpUrl": "wss://agent.example/ws",
+  "acpSecret": "change-me",
+  "defaultCwd": "/srv/work",
+  "defaultModel": "grok-4"
+}
+```
+
+The secret is plaintext: `chmod 600` the file and keep it outside the default task cwd, for example
+`GROK_WEB_CONFIG=/etc/grok-build-web/config.json`. The agent's shell runs in that cwd and can read
+anything there.
+
+An unreadable file, malformed JSON, an unknown key, a value of the wrong type, a `defaultCwd` that
+resolves to `/`, or an `acpUrl` that is not `ws:` or `wss:` stops the server at startup with a
+message naming the file and the offending field. An invalid `GROK_ACP_URL` also stops startup, where
+it previously started and then failed to connect.
+
+The web UI is view-only: it shows the resolved values, whether a secret is configured, whether the
+config file exists, and its path. Nothing in the API can change them, so only someone who can edit
+the file on the server host and restart the server can change settings.
 
 The secret is never returned by the API. `redactUrl` strips URL credentials and masks any query
 parameter whose name matches `key|secret|token|password`.
+
+## Projects
+
+A project is a name plus a directory on the server host. The sidebar folds tasks into one accordion
+section per project, and the New task dialog picks a project instead of asking for a working
+directory. The server stores a task's canonical cwd, so a symlinked or relative spelling of a
+project root still lands in its section, and a task belongs to the longest project root that contains
+its cwd on a path-segment boundary. Tasks outside every project stay in an "Ungrouped" section.
+
+Projects live in server memory for the lifetime of the process: a restart loses them together with
+the task list, and `GROK_WEB_MAX_PROJECTS` (default 50) bounds how many can accumulate. A project
+root must be an existing directory under `defaultCwd` or an allowed root, `/` is rejected, and the
+canonical real path is stored, so two spellings of the same directory cannot become two projects. The
+picker shows one anchored row per reachable root — every bound that no other bound already covers, so
+`defaultCwd` gets a row only when no allowed root contains it — and expands directories lazily through
+`GET /api/fs/dirs`, so a disjoint allowed root is browsable even though its parent lies outside the
+bounds. Each listing returns at most the first 200 subdirectories and flags the cut with `truncated`;
+hidden entries and symlinks are never listed. Creating a project is a normal web action, so it still
+works when `GROK_WEB_READ_ONLY=1`; task creation and prompts stay blocked.
 
 ## Security model
 
@@ -81,7 +137,8 @@ parameter whose name matches `key|secret|token|password`.
 - **JSON only.** Request bodies must be `application/json` (415 otherwise), are read with a byte cap
   (413), and malformed JSON is a 400.
 - **Task cwd is a trust root.** `POST /api/tasks` rejects a cwd outside the default cwd or an allowed
-  root, and `terminal/create` rejects a cwd outside the task cwd or an allowed root.
+  root, and `terminal/create` rejects a cwd outside the task cwd or an allowed root. Project roots and
+  `GET /api/fs/dirs` use the same bounds and canonicalise before checking them.
 - **fs bridge.** Paths are resolved and realpathed on both sides (including symlinked roots), the
   final component is opened with `O_NOFOLLOW`, reads and writes are size-capped, and writes are
   disabled by `GROK_WEB_READ_ONLY`.
@@ -90,13 +147,19 @@ parameter whose name matches `key|secret|token|password`.
   `GROK_AGENT_SECRET` — the agent's shell tool needs the rest of the environment.
 - **Read-only mode** rejects task creation, prompts and chat, and disables fs writes and terminals.
   It cannot stop an already-running agent turn, because the agent's own tools run inside the agent.
+- **Settings are host-only.** The ACP URL and secret come from the config file and no HTTP request
+  can change them, so a browser cannot point the server at another WebSocket endpoint and have the
+  stored secret sent there.
 - **Permissions** are per task: yolo tasks auto-select `allow_once`/`allow_always`, other requests
   wait for the browser and are cancelled after the configured timeout.
 
 ## HTTP API
 
-- `GET /api/health`, `GET /api/settings`, `PUT /api/settings`
+- `GET /api/health`, `GET /api/settings` (read-only snapshot)
 - `GET /api/agent`
+- `GET /api/projects`, `POST /api/projects` — projects with a bounded root
+- `GET /api/fs/dirs?path=…` — subdirectories of a bounded directory for the project picker; an
+  absent or empty `path` starts at `defaultCwd`
 - `GET /api/tasks`, `POST /api/tasks`
 - `GET /api/tasks/:id`, `POST /api/tasks/:id/prompt`, `POST /api/tasks/:id/cancel`,
   `POST /api/tasks/:id/close`, `POST /api/tasks/:id/permission`
@@ -159,6 +222,6 @@ systemd-run --user --wait --collect --pipe \
 
 ## Session state
 
-Tasks live in server memory for the lifetime of the process. A server restart loses the task list, and
-ACP sessions do not survive a restart. The AG-UI message ids are run-scoped, so a new turn never
-appends to the previous turn's message.
+Tasks and projects live in server memory for the lifetime of the process. A server restart loses the
+task list and the project list, and ACP sessions do not survive a restart. The AG-UI message ids are
+run-scoped, so a new turn never appends to the previous turn's message.
