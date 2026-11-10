@@ -6,6 +6,7 @@ import type {
 } from "@grok-build-web/acp-protocol";
 import {
   encodeError,
+  encodeNotification,
   encodeRequest,
   encodeResult,
   isResponse,
@@ -55,21 +56,23 @@ export interface IncomingRequest {
   readonly request: ClientRequest;
   readonly requestId: JsonRpcId;
   readonly reply: (result: unknown) => Effect.Effect<void>;
+  readonly fail: (code: number, message: string) => Effect.Effect<void>;
 }
 
 export interface AcpClientShape {
-  readonly url: string;
   readonly status: Effect.Effect<AcpStatusInfo>;
   readonly statusChanges: Stream.Stream<AcpStatusInfo>;
   readonly notifications: Stream.Stream<ServerNotification>;
   readonly incomingRequests: Stream.Stream<IncomingRequest>;
   readonly connect: Effect.Effect<void>;
   readonly disconnect: Effect.Effect<void>;
+  readonly reconfigure: (url: string, secret: string | undefined) => Effect.Effect<void>;
   readonly request: (
     method: string,
     params: unknown,
     requestTimeoutMs?: number,
   ) => Effect.Effect<unknown, AcpError>;
+  readonly notify: (method: string, params: unknown) => Effect.Effect<void, AcpError>;
 }
 
 export class AcpClient extends Context.Service<AcpClient, AcpClientShape>()(
@@ -92,11 +95,11 @@ export const make = (
   config: AcpClientConfig,
 ): Effect.Effect<AcpClientShape, never, Socket.WebSocketConstructor | Scope.Scope> =>
   Effect.gen(function* () {
-    const url = connectionUrl(config.url, config.secret);
+    const urlRef = yield* Ref.make(connectionUrl(config.url, config.secret));
     const backoff = config.backoff ?? defaultBackoff;
     const requestTimeoutMs = config.requestTimeoutMs ?? 120_000;
 
-    const statusRef = yield* Ref.make<AcpStatusInfo>({ state: "disconnected", url });
+    const statusRef = yield* Ref.make<AcpStatusInfo>({ state: "disconnected", url: "" });
     const statusPub = yield* PubSub.unbounded<AcpStatusInfo>();
     const notificationPub = yield* PubSub.unbounded<ServerNotification>();
     const requestPub = yield* PubSub.unbounded<IncomingRequest>();
@@ -106,15 +109,16 @@ export const make = (
     const attemptRef = yield* Ref.make(0);
     const startedRef = yield* Ref.make(false);
     const fiberRef = yield* Ref.make<Fiber.Fiber<void> | undefined>(undefined);
-    const settled = yield* Deferred.make<AcpStatusInfo>();
+    const settledRef = yield* Ref.make(yield* Deferred.make<AcpStatusInfo>());
     const context = yield* Effect.context<Socket.WebSocketConstructor | Scope.Scope>();
+    const url = () => Ref.get(urlRef);
 
     const publishStatus = (info: AcpStatusInfo) =>
       Effect.gen(function* () {
         yield* Ref.set(statusRef, info);
         yield* PubSub.publish(statusPub, info);
         if (info.state === "connected" || info.state === "error") {
-          yield* Deferred.succeed(settled, info);
+          yield* Deferred.succeed(yield* Ref.get(settledRef), info);
         }
       });
 
@@ -162,6 +166,7 @@ export const make = (
             request,
             requestId: message.id,
             reply: (result) => replyFrame(encodeResult(message.id, result)),
+            fail: (code, text) => replyFrame(encodeError(message.id, code, text)),
           });
           return;
         }
@@ -170,13 +175,13 @@ export const make = (
       });
 
     const connectAttempt = Effect.gen(function* () {
-      yield* publishStatus({ state: "connecting", url });
-      const socket = yield* Socket.makeWebSocket(url);
+      yield* publishStatus({ state: "connecting", url: yield* url() });
+      const socket = yield* Socket.makeWebSocket(yield* url());
       const writer = yield* socket.writer;
       yield* Ref.set(writerRef, writer);
       const reader = yield* socket.reader;
       yield* Ref.set(attemptRef, 0);
-      yield* publishStatus({ state: "connected", url });
+      yield* publishStatus({ state: "connected", url: yield* url() });
       yield* Effect.forever(
         Effect.gen(function* () {
           const frames = yield* reader.pull;
@@ -192,11 +197,11 @@ export const make = (
         const exit = yield* Effect.exit(Effect.scoped(connectAttempt));
         yield* Ref.set(writerRef, undefined);
         if (Exit.isSuccess(exit)) {
-          yield* publishStatus({ state: "disconnected", url });
+          yield* publishStatus({ state: "disconnected", url: yield* url() });
         } else {
           const message = Cause.pretty(exit.cause);
           yield* failPending(message);
-          yield* publishStatus({ state: "error", url, lastError: message });
+          yield* publishStatus({ state: "error", url: yield* url(), lastError: message });
         }
         const attempt = yield* Ref.updateAndGet(attemptRef, (value) => value + 1);
         yield* Effect.sleep(nextDelay(attempt, backoff));
@@ -206,9 +211,10 @@ export const make = (
     const connect = Effect.gen(function* () {
       const started = yield* Ref.getAndSet(startedRef, true);
       if (started) return;
+      yield* Ref.set(settledRef, yield* Deferred.make<AcpStatusInfo>());
       const fiber = yield* Effect.forkScoped(supervise);
       yield* Ref.set(fiberRef, fiber);
-      yield* Deferred.await(settled);
+      yield* Deferred.await(yield* Ref.get(settledRef));
     }).pipe(Effect.provide(context));
 
     const disconnect = Effect.gen(function* () {
@@ -216,8 +222,23 @@ export const make = (
       if (fiber !== undefined) yield* Fiber.interrupt(fiber);
       yield* Ref.set(writerRef, undefined);
       yield* failPending("ACP client disconnected");
-      yield* publishStatus({ state: "disconnected", url });
+      yield* publishStatus({ state: "disconnected", url: yield* url() });
     });
+
+    const reconfigure = (nextUrl: string, secret: string | undefined) =>
+      Effect.gen(function* () {
+        const fiber = yield* Ref.get(fiberRef);
+        if (fiber !== undefined) yield* Fiber.interrupt(fiber);
+        yield* Ref.set(urlRef, connectionUrl(nextUrl, secret));
+        yield* Ref.set(startedRef, false);
+        yield* Ref.set(writerRef, undefined);
+        yield* failPending("ACP connection reconfigured");
+        yield* publishStatus({ state: "disconnected", url: yield* url() });
+        yield* Ref.set(settledRef, yield* Deferred.make<AcpStatusInfo>());
+        const restarted = yield* Effect.forkScoped(supervise);
+        yield* Ref.set(fiberRef, restarted);
+        yield* Deferred.await(yield* Ref.get(settledRef));
+      }).pipe(Effect.provide(context));
 
     const request = (method: string, params: unknown, timeoutOverride?: number) =>
       Effect.gen(function* () {
@@ -242,15 +263,27 @@ export const make = (
         return result.value;
       });
 
+    const notify = (method: string, params: unknown) =>
+      Effect.gen(function* () {
+        const writer = yield* Ref.get(writerRef);
+        if (writer === undefined) {
+          return yield* new AcpError({ message: "ACP client is not connected" });
+        }
+        yield* writer
+          .write(encodeNotification(method, params))
+          .pipe(Effect.mapError((cause) => new AcpError({ message: String(cause) })));
+      });
+
     return {
-      url,
       status: Ref.get(statusRef),
       statusChanges: Stream.fromPubSub(statusPub),
       notifications: Stream.fromPubSub(notificationPub),
       incomingRequests: Stream.fromPubSub(requestPub),
       connect,
       disconnect,
+      reconfigure,
       request,
+      notify,
     };
   });
 
