@@ -1,8 +1,7 @@
-import { AcpClient, isWithin } from "@grok-build-web/acp-client";
+import { AcpClient } from "@grok-build-web/acp-client";
 import { Context, Effect, Layer, Ref } from "effect";
 import { resolve } from "node:path";
-import { isUsableRoot } from "./paths.ts";
-import { realpathOfExistingAncestor } from "./realpath.ts";
+import { isUsableRoot, resolveRealPath } from "./paths.ts";
 
 export interface ServerConfig {
   readonly acpUrl: string;
@@ -156,33 +155,19 @@ export const makeSettings = (
         let defaultCwd = previous.defaultCwd;
         if (patch.defaultCwd !== undefined) {
           // Canonicalise, so a symlink cannot install a root outside the allowed roots.
-          const candidate = yield* Effect.promise(() =>
-            realpathOfExistingAncestor(resolve(config.serverCwd, patch.defaultCwd ?? "")),
+          const roots =
+            config.allowedRoots.length === 0 ? [] : [config.serverCwd, ...config.allowedRoots];
+          const resolved = yield* resolveRealPath(
+            resolve(config.serverCwd, patch.defaultCwd),
+            roots,
           );
-          if (!isUsableRoot(candidate)) {
+          if (resolved === undefined) {
             return {
               ok: false,
-              message: "The default working directory cannot be the filesystem root",
+              message: "The default working directory is outside the allowed roots",
             };
           }
-          if (config.allowedRoots.length > 0) {
-            const serverRoot = yield* Effect.promise(() =>
-              realpathOfExistingAncestor(config.serverCwd),
-            );
-            const roots = yield* Effect.promise(() =>
-              Promise.all(config.allowedRoots.map(realpathOfExistingAncestor)),
-            );
-            if (
-              !isWithin(candidate, serverRoot) &&
-              !roots.some((root) => isWithin(candidate, root))
-            ) {
-              return {
-                ok: false,
-                message: "The default working directory is outside the allowed roots",
-              };
-            }
-          }
-          defaultCwd = candidate;
+          defaultCwd = resolved;
         }
         const next: SettingsState = {
           url,

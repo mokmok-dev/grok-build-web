@@ -5,6 +5,7 @@ import {
   applyNotification,
   applySessionChange,
   createTask,
+  failPrompt,
   markClosed,
   markError,
   markReady,
@@ -154,6 +155,19 @@ describe("lifecycle", () => {
   it("keeps a claim that belongs to another turn", () => {
     const current = task({ status: "running", runningPromptId: "c1" });
     expect(finishPrompt(current, "other", 8)).toBe(current);
+  });
+
+  it("fails a task only for the turn that owns the claim", () => {
+    expect(
+      failPrompt(task({ status: "running", runningPromptId: "c1" }), "c1", "boom", 8),
+    ).toMatchObject({
+      status: "error",
+      lastError: "boom",
+      runningPromptId: undefined,
+      updatedAt: 8,
+    });
+    const current = task({ status: "running", runningPromptId: "c2" });
+    expect(failPrompt(current, "c1", "late", 8)).toBe(current);
   });
 
   it("sets and clears a pending permission", () => {

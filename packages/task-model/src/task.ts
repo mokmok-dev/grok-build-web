@@ -127,6 +127,12 @@ export const markClosed = (task: Task, now: number): Task =>
 export const markError = (task: Task, message: string, now: number): Task =>
   touched(task, now, { status: "error", lastError: message, runningPromptId: undefined });
 
+/** Fails the task only when the failing turn still owns the claim. */
+export const failPrompt = (task: Task, claimId: string, message: string, now: number): Task =>
+  task.runningPromptId !== claimId
+    ? task
+    : touched(task, now, { status: "error", lastError: message, runningPromptId: undefined });
+
 export const startPrompt = (task: Task, promptId: string, text: string, now: number): Task =>
   touched(task, now, {
     status: "running",

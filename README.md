@@ -120,6 +120,11 @@ build and the mutation gate are all exercised with the pinned pnpm version.
 a built server and a Chromium the flake does not ship. The flake covers unit, integration and mutation
 checks; run `pnpm e2e` by hand after `pnpm build` when changing the web UI or the ACP wiring.
 
+`pnpm mutation` first runs `scripts/assert-mutation-scripts.mjs`, which fails when any package
+lacks `"mutation": "stryker run"`, and then runs every package without `--if-present`. The flag
+existed only in the scaffold and intermediate snapshots, whose stub packages had no Stryker config
+yet; `pnpm -r run` skips projects without the script silently, which is why the assertion exists.
+
 **Mutation scope.** Stryker mutates `packages/*` — `acp-protocol`, `task-model`, and the pure modules
 of `acp-client` (`jsonrpc-client.ts`, `backoff.ts`, `policy.ts`) — and must keep a 100% score with a
 100/100/100 threshold. `apps/*` and the Effect socket client are not mutated: their behaviour lives in

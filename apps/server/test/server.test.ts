@@ -1,5 +1,5 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,6 +29,7 @@ interface FakeAcp {
   readonly sendRequest: (id: number, method: string, params: unknown) => void;
   readonly sendNotification: (method: string, params: unknown) => void;
   readonly releasePrompt: () => boolean;
+  readonly failWithheldPrompt: () => boolean;
   readonly waitForFrame: (
     predicate: (frame: Frame) => boolean,
     label: string,
@@ -45,6 +46,7 @@ const startFakeAcp = async (options: FakeOptions = {}): Promise<FakeAcp> => {
   const sockets: WebSocket[] = [];
   const waiters: { predicate: (frame: Frame) => boolean; resolve: (frame: Frame) => void }[] = [];
   const heldPrompts: Array<() => void> = [];
+  const withheldReplies: Array<() => void> = [];
   let sessions = 0;
 
   const write = (socket: WebSocket, value: unknown): void => {
@@ -146,7 +148,9 @@ const startFakeAcp = async (options: FakeOptions = {}): Promise<FakeAcp> => {
               update: { sessionUpdate: "turn_completed", usage: { totalTokens: 3 } },
             });
             notify("_x.ai/session/prompt_complete", { sessionId, promptId: "p" });
-            if (options.withholdReply !== true) {
+            if (options.withholdReply === true) {
+              withheldReplies.push(() => failReply(socket, id, -32000, "late failure"));
+            } else {
               respond(socket, id, { stopReason: "end_turn", usage: { totalTokens: 3 } });
             }
           };
@@ -187,6 +191,12 @@ const startFakeAcp = async (options: FakeOptions = {}): Promise<FakeAcp> => {
     sendNotification: (method, params) => notify(method, params),
     releasePrompt: () => {
       const next = heldPrompts.shift();
+      if (next === undefined) return false;
+      next();
+      return true;
+    },
+    failWithheldPrompt: () => {
+      const next = withheldReplies.shift();
       if (next === undefined) return false;
       next();
       return true;
@@ -252,6 +262,51 @@ const rawCall = (
   );
 
 const json = async <A>(response: Response): Promise<A> => (await response.json()) as A;
+
+const chunkedPost = (port: number, body: string): Promise<number> =>
+  new Promise((resolve, reject) => {
+    const request = httpRequest(
+      {
+        host: "127.0.0.1",
+        port,
+        path: "/api/tasks",
+        method: "POST",
+        headers: { "content-type": "application/json", "transfer-encoding": "chunked" },
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode ?? 0));
+      },
+    );
+    request.on("error", reject);
+    const half = Math.floor(body.length / 2);
+    request.write(body.slice(0, half));
+    request.end(body.slice(half));
+  });
+
+const withNodeServer = async <A>(
+  config: ServerConfig,
+  use: (port: number) => Promise<A>,
+): Promise<A> => {
+  const infra = NodeHttpServer.layer(() => createServer(), { port: 0, host: "127.0.0.1" });
+  const app = HttpRouter.serve(appLayer(config), {
+    disableLogger: true,
+    disableListenLog: true,
+  }).pipe(Layer.provide(infra));
+  const server = Layer.merge(infra, app);
+  return Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const context = yield* Layer.build(server);
+        return yield* Effect.gen(function* () {
+          const running = yield* HttpServer.HttpServer;
+          const port = Number(new URL(NetAddress.formatUrlUnsafe(running.address)).port);
+          return yield* Effect.promise(() => use(port));
+        }).pipe(Effect.provide(context));
+      }),
+    ),
+  );
+};
 
 interface Harness {
   readonly handler: Handler;
@@ -576,6 +631,45 @@ describe("server", () => {
     expect(second.status).toBe(200);
   });
 
+  it("does not let a late failure from an older turn fail the newer one", async () => {
+    const harness = await startHarness({ holdPrompts: true, withholdReply: true });
+    await connected(harness);
+    const detail = await createTask(harness);
+
+    const first = await call(harness.handler, "POST", `/api/tasks/${detail.id}/prompt`, {
+      text: "first",
+    });
+    expect(first.status).toBe(200);
+    await harness.acp.waitForFrame(
+      (frame) => frame["method"] === "session/prompt",
+      "the first prompt",
+    );
+    harness.acp.releasePrompt();
+    await waitFor(async () => {
+      const task = await json<{ status: string }>(
+        await call(harness.handler, "GET", `/api/tasks/${detail.id}`),
+      );
+      return task.status === "idle" ? true : undefined;
+    });
+
+    const second = await call(harness.handler, "POST", `/api/tasks/${detail.id}/prompt`, {
+      text: "second",
+    });
+    expect(second.status).toBe(200);
+    expect(harness.acp.failWithheldPrompt()).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const current = await json<{ status: string; lastError?: string }>(
+      await call(harness.handler, "GET", `/api/tasks/${detail.id}`),
+    );
+    expect(current.status).toBe("running");
+    expect(current.lastError).toBeUndefined();
+    const third = await call(harness.handler, "POST", `/api/tasks/${detail.id}/prompt`, {
+      text: "third",
+    });
+    expect(third.status).toBe(400);
+  });
+
   it("reports terminal spawn failures and unknown waits", async () => {
     const harness = await startHarness();
     await connected(harness);
@@ -844,7 +938,7 @@ describe("server", () => {
     expect(malformed.status).toBe(400);
   });
 
-  it("returns 413 for an oversized body on the Node transport", async () => {
+  it("returns 413 for oversized bodies on the Node transport", async () => {
     const acp = await startFakeAcp();
     const cwd = await mkdtemp(join(tmpdir(), "grok-web-node-"));
     const config = loadConfig({
@@ -852,34 +946,20 @@ describe("server", () => {
       GROK_ACP_SECRET: "testsecret",
       GROK_WEB_DEFAULT_CWD: cwd,
     });
-    const infra = NodeHttpServer.layer(() => createServer(), { port: 0, host: "127.0.0.1" });
-    const app = HttpRouter.serve(appLayer(config), {
-      disableLogger: true,
-      disableListenLog: true,
-    }).pipe(Layer.provide(infra));
-    // Merge the infra layer so the built context exposes the listening address.
-    const server = Layer.merge(infra, app);
+    const oversized = JSON.stringify({ cwd, padding: "x".repeat(300_000) });
     try {
-      const status = await Effect.runPromise(
-        Effect.scoped(
-          Effect.gen(function* () {
-            const context = yield* Layer.build(server);
-            return yield* Effect.gen(function* () {
-              const running = yield* HttpServer.HttpServer;
-              const url = NetAddress.formatUrlUnsafe(running.address);
-              const response = yield* Effect.promise(() =>
-                fetch(`${url}/api/tasks`, {
-                  method: "POST",
-                  headers: { "content-type": "application/json" },
-                  body: JSON.stringify({ cwd, padding: "x".repeat(300_000) }),
-                }),
-              );
-              return response.status;
-            }).pipe(Effect.provide(context));
-          }),
-        ),
+      const plain = await withNodeServer(config, (port) =>
+        fetch(`http://127.0.0.1:${port}/api/tasks`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: oversized,
+        }).then((response) => response.status),
       );
-      expect(status).toBe(413);
+      expect(plain).toBe(413);
+
+      // No content-length: the body streams chunked, so the /exceed/i classifier answers.
+      const chunked = await withNodeServer(config, (port) => chunkedPost(port, oversized));
+      expect(chunked).toBe(413);
     } finally {
       await acp.close();
     }

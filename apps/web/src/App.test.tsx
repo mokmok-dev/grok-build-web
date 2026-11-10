@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App.tsx";
@@ -393,10 +393,35 @@ describe("App", () => {
       }
       if (call.path === "/api/tasks/s1") {
         await gate;
-        return { body: detail({ title: "Old" }) };
+        return {
+          body: detail({
+            title: "Old",
+            messages: [
+              {
+                id: "u1",
+                role: "user",
+                createdAt: 1,
+                parts: [{ type: "text", text: "stale transcript" }],
+              },
+            ],
+          }),
+        };
       }
       if (call.path === "/api/tasks/s2") {
-        return { body: detail({ id: "s2", title: "Second" }) };
+        return {
+          body: detail({
+            id: "s2",
+            title: "Second",
+            messages: [
+              {
+                id: "u2",
+                role: "user",
+                createdAt: 1,
+                parts: [{ type: "text", text: "second transcript" }],
+              },
+            ],
+          }),
+        };
       }
       return baseRoutes(call);
     });
@@ -407,6 +432,8 @@ describe("App", () => {
     releaseFirst?.();
     await new Promise((resolve) => setTimeout(resolve, 250));
     expect(screen.getByRole("heading", { name: "Second" })).toBeTruthy();
+    expect(screen.getByText("second transcript")).toBeTruthy();
+    expect(screen.queryByText("stale transcript")).toBeNull();
     expect(screen.queryByRole("heading", { name: "Old" })).toBeNull();
   });
 
@@ -432,6 +459,87 @@ describe("App", () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
     });
     expect(document.activeElement).toBe(menu);
+  });
+
+  it("shows an error when the task list fails to load", async () => {
+    installFetch((call) => {
+      if (call.path === "/api/tasks" && call.method === "GET") {
+        return { status: 500, body: { error: "list failed" } };
+      }
+      return baseRoutes(call);
+    });
+    render(<App />);
+    expect(await screen.findByText("list failed")).toBeTruthy();
+  });
+
+  it("falls back when settings and agent fetches fail", async () => {
+    const user = userEvent.setup();
+    installFetch((call) => {
+      if (call.path === "/api/settings" || call.path === "/api/agent") {
+        throw new Error("unavailable");
+      }
+      return baseRoutes(call);
+    });
+    render(<App />);
+    await screen.findByText("My task");
+    await user.click(screen.getByRole("button", { name: "New task" }));
+    const cwd = (await screen.findByLabelText("Working directory")) as HTMLInputElement;
+    expect(cwd.value).toBe("");
+    const options = within(screen.getByLabelText("Model")).getAllByRole("option");
+    expect(options).toHaveLength(1);
+    expect(options[0]?.textContent).toBe("Default");
+  });
+
+  it("reports a failed permission submit", async () => {
+    const user = userEvent.setup();
+    installFetch((call) => {
+      if (call.path === "/api/tasks/s1") {
+        return {
+          body: detail({
+            pendingPermission: {
+              requestId: "r1",
+              toolCallId: "t1",
+              title: "Run ls",
+              options: [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }],
+            },
+          }),
+        };
+      }
+      if (call.path === "/api/tasks/s1/permission") {
+        return { status: 400, body: { error: "permission rejected" } };
+      }
+      return baseRoutes(call);
+    });
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /My task/ }));
+    await user.click(await screen.findByRole("button", { name: "Allow once" }));
+    expect(await screen.findByText("permission rejected")).toBeTruthy();
+  });
+
+  it("reports a failed settings submit", async () => {
+    const user = userEvent.setup();
+    installFetch((call) => {
+      if (call.path === "/api/settings" && call.method === "PUT") {
+        return { status: 400, body: { error: "settings rejected" } };
+      }
+      return baseRoutes(call);
+    });
+    render(<App />);
+    await screen.findByText("My task");
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    await user.click(await screen.findByRole("button", { name: "Save" }));
+    expect(await screen.findByText("settings rejected")).toBeTruthy();
+  });
+
+  it("closes the new-task dialog", async () => {
+    const user = userEvent.setup();
+    installFetch(baseRoutes);
+    render(<App />);
+    await screen.findByText("My task");
+    await user.click(screen.getByRole("button", { name: "New task" }));
+    expect(await screen.findByRole("dialog", { name: "New task" })).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "New task" })).toBeNull();
   });
 
   it("shows an API error", async () => {

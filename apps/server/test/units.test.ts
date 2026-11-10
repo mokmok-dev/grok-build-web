@@ -14,7 +14,7 @@ import {
   resolveRoots,
 } from "../src/config.ts";
 import { fsBridgeLayer, FsBridge, type FsBridgeShape } from "../src/fs-bridge.ts";
-import { resolveTerminalCwd, taskCwdAllowed } from "../src/paths.ts";
+import { resolveRealPath, resolveTerminalCwd, taskCwdAllowed } from "../src/paths.ts";
 import { realpathOfExistingAncestor } from "../src/realpath.ts";
 import { checkRequest, readJsonBody, requestGuardPolicy } from "../src/security.ts";
 import { makeTerminalRegistry } from "../src/terminal.ts";
@@ -285,6 +285,17 @@ describe("paths", () => {
     await symlink(outside, link);
     const policy = { serverCwd: root, defaultCwd: root, allowedRoots: [] };
     expect(await Effect.runPromise(taskCwdAllowed(link, policy))).toBe(false);
+  });
+
+  it("resolves real paths and treats an empty root list as unbounded", async () => {
+    const root = await dir();
+    const candidate = join(root, "sub");
+    expect(await Effect.runPromise(resolveRealPath(candidate, []))).toBe(
+      await realpathOfExistingAncestor(candidate),
+    );
+    expect(await Effect.runPromise(resolveRealPath("/", []))).toBeUndefined();
+    expect(await Effect.runPromise(resolveRealPath(candidate, [root]))).toBeDefined();
+    expect(await Effect.runPromise(resolveRealPath("/etc", [root]))).toBeUndefined();
   });
 
   it("guards and resolves terminal cwds", async () => {

@@ -15,6 +15,7 @@ import {
   applyNotification,
   applySessionChange,
   createTask,
+  failPrompt,
   finishPrompt,
   markClosed,
   markError,
@@ -237,7 +238,8 @@ export const makeTaskRegistry = (
         Effect.matchEffect({
           onFailure: (error) =>
             Effect.gen(function* () {
-              yield* update(id, (task) => markError(task, error.message, now()));
+              // A late failure from an older turn must not fail the turn that owns the claim now.
+              yield* update(id, (task) => failPrompt(task, claimId, error.message, now()));
               return yield* Effect.fail(error);
             }),
           onSuccess: (value) =>
