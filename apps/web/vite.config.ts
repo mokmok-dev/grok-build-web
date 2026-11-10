@@ -1,10 +1,18 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
 
+const listOf = (value: string | undefined): string[] =>
+  (value ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
+
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: "127.0.0.1",
+    // Dev only: `pnpm dev:tailnet` sets both variables to the Tailscale address.
+    allowedHosts: listOf(process.env["GROK_WEB_ALLOWED_HOSTS"]),
+    host: process.env["GROK_WEB_DEV_HOST"] ?? "127.0.0.1",
     port: 5173,
     strictPort: true,
     proxy: {

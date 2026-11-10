@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc -b tsconfig.json && pnpm --filter @grok-build-web/web build",
     "dev": "tsc -b tsconfig.json && concurrently -k -n server,web -c blue,green \"pnpm --filter @grok-build-web/server dev\" \"pnpm --filter @grok-build-web/web dev\"",
+    "dev:tailnet": "node scripts/dev-tailnet.mjs",
     "e2e": "pnpm --filter @grok-build-web/web e2e",
     "mutation": "node scripts/assert-mutation-scripts.mjs && pnpm -r --filter \"./packages/*\" --workspace-concurrency=1 mutation",
     "test": "vitest --run",
