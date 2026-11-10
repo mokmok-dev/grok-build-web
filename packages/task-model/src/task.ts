@@ -66,7 +66,7 @@ export interface Task {
   readonly configOptions: readonly unknown[];
   readonly queue: readonly QueueEntry[];
   readonly runningPromptId?: string;
-  readonly hydrated: boolean;
+  readonly yolo: boolean;
 }
 
 export interface TaskSummary {
@@ -81,6 +81,7 @@ export interface TaskSummary {
   readonly pendingPermission?: PendingPermission;
   readonly usage: Usage;
   readonly lastError?: string;
+  readonly yolo: boolean;
 }
 
 export interface CreateTaskInput {
@@ -88,6 +89,7 @@ export interface CreateTaskInput {
   readonly cwd: string;
   readonly title?: string;
   readonly model?: string;
+  readonly yolo?: boolean;
   readonly now: number;
 }
 
@@ -108,7 +110,7 @@ export const createTask = (input: CreateTaskInput): Task => ({
   configOptions: [],
   queue: [],
   runningPromptId: undefined,
-  hydrated: false,
+  yolo: input.yolo ?? false,
 });
 
 const touched = (task: Task, now: number, patch: Partial<Task>): Task => ({
@@ -117,21 +119,22 @@ const touched = (task: Task, now: number, patch: Partial<Task>): Task => ({
   updatedAt: now,
 });
 
-export const markReady = (task: Task, now: number): Task =>
-  touched(task, now, { status: "idle", hydrated: true });
+export const markReady = (task: Task, now: number): Task => touched(task, now, { status: "idle" });
 
 export const markClosed = (task: Task, now: number): Task =>
   touched(task, now, { status: "closed" });
 
 export const markError = (task: Task, message: string, now: number): Task =>
-  touched(task, now, { status: "error", lastError: message });
+  touched(task, now, { status: "error", lastError: message, runningPromptId: undefined });
 
-export const markHydrated = (task: Task, now: number): Task =>
-  touched(task, now, { hydrated: true });
+/** Fails the task only when the failing turn still owns the claim. */
+export const failPrompt = (task: Task, claimId: string, message: string, now: number): Task =>
+  task.runningPromptId !== claimId ? task : markError(task, message, now);
 
-export const appendUserMessage = (task: Task, text: string, now: number): Task =>
+export const startPrompt = (task: Task, promptId: string, text: string, now: number): Task =>
   touched(task, now, {
     status: "running",
+    runningPromptId: promptId,
     messages: [
       ...task.messages,
       {
@@ -142,6 +145,15 @@ export const appendUserMessage = (task: Task, text: string, now: number): Task =
       },
     ],
   });
+
+/** Releases the claim, but only for the turn that still owns it. */
+export const finishPrompt = (task: Task, claimId: string, now: number): Task =>
+  task.runningPromptId !== claimId
+    ? task
+    : touched(task, now, {
+        runningPromptId: undefined,
+        status: task.pendingPermission === undefined ? "idle" : "awaiting_permission",
+      });
 
 export const setPendingPermission = (
   task: Task,
@@ -295,6 +307,7 @@ const applySessionNotification = (
     case "turn_completed":
       return touched(task, now, {
         status: "idle",
+        runningPromptId: undefined,
         usage: mergeUsage(task.usage, update.usage),
       });
     case "response_completed":
@@ -332,8 +345,11 @@ const applyQueueChanged = (
 ): Task =>
   touched(task, now, {
     queue: notification.entries,
-    runningPromptId: notification.runningPromptId,
-    status: notification.runningPromptId === undefined ? "idle" : "running",
+    // The queue reports the agent's turn, not our claim, so it only derives the status.
+    status:
+      notification.runningPromptId === undefined && task.runningPromptId === undefined
+        ? "idle"
+        : "running",
   });
 
 export const applyNotification = (
@@ -349,7 +365,10 @@ export const applyNotification = (
     case "queue_changed":
       return applyQueueChanged(task, notification, now);
     case "prompt_complete":
-      return touched(task, now, { status: "idle", runningPromptId: undefined });
+      // The agent's prompt id is its own, so completion is matched by claim presence, not by id.
+      return task.runningPromptId === undefined
+        ? task
+        : touched(task, now, { status: "idle", runningPromptId: undefined });
     default:
       return task;
   }
@@ -382,4 +401,17 @@ export const toSummary = (task: Task): TaskSummary => ({
   pendingPermission: task.pendingPermission,
   usage: task.usage,
   lastError: task.lastError,
+  yolo: task.yolo,
+});
+
+export type TaskDetail = TaskSummary &
+  Pick<Task, "messages" | "plan" | "availableCommands" | "configOptions" | "queue">;
+
+export const toDetail = (task: Task): TaskDetail => ({
+  ...toSummary(task),
+  messages: task.messages,
+  plan: task.plan,
+  availableCommands: task.availableCommands,
+  configOptions: task.configOptions,
+  queue: task.queue,
 });

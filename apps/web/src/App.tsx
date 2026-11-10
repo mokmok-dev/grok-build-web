@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchServerSentEvents, useChat } from "@tanstack/ai-react";
-import type { TaskSummary } from "@grok-build-web/task-model";
+import type { PendingPermission, TaskSummary } from "@grok-build-web/task-model";
 import {
   cancelTask,
   closeTask,
+  CONNECTION_LABELS,
+  connectionOf,
   createTask,
   fetchAgent,
   fetchHealth,
@@ -27,20 +29,41 @@ import { TaskHeader } from "./components/TaskHeader.tsx";
 import { TaskList } from "./components/TaskList.tsx";
 import { Transcript } from "./components/Transcript.tsx";
 
-type Connection = "connected" | "reconnecting" | "disconnected" | "not-configured";
-
-const connectionOf = (settings: Settings | null, health: Health | null): Connection => {
-  if (settings === null || !settings.hasSecret) return "not-configured";
-  if (health === null) return "disconnected";
-  if (health.acp.connected) return "connected";
-  return health.acp.lastError === undefined ? "disconnected" : "reconnecting";
+const useMobile = (): boolean => {
+  const [mobile, setMobile] = useState(false);
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const query = window.matchMedia("(max-width: 800px)");
+    const update = (): void => setMobile(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+  return mobile;
 };
 
-const connectionLabel: Record<Connection, string> = {
-  connected: "Connected",
-  reconnecting: "Reconnecting",
-  disconnected: "Disconnected",
-  "not-configured": "Not configured",
+const PermissionPrompt = ({
+  detail,
+  connected,
+  onDecide,
+}: {
+  readonly detail: TaskDetail;
+  readonly connected: boolean;
+  readonly onDecide: (
+    taskId: string,
+    permission: PendingPermission,
+    decision: PermissionDecision,
+  ) => void;
+}) => {
+  const permission = detail.pendingPermission;
+  if (permission === undefined) return null;
+  return (
+    <PermissionBanner
+      permission={permission}
+      disabled={!connected}
+      onDecide={(decision) => onDecide(detail.id, permission, decision)}
+    />
+  );
 };
 
 const ChatPanel = ({
@@ -106,6 +129,14 @@ export const App = () => {
   const [showSettings, setShowSettings] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const mobile = useMobile();
+
+  const selectedIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedId;
+  const loadedIdRef = useRef<string | null>(null);
+  const menuRef = useRef<HTMLButtonElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const mountedRef = useRef(false);
 
   const reloadTasks = useCallback(async () => {
     try {
@@ -157,52 +188,84 @@ export const App = () => {
     };
   }, [reloadTasks, reloadHealth]);
 
-  const selected = tasks.find((task) => task.id === selectedId);
+  const loadDetail = useCallback(async (id: string) => {
+    try {
+      const next = await fetchTask(id);
+      if (selectedIdRef.current === id) setDetail(next);
+    } catch (cause) {
+      if (selectedIdRef.current === id) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    }
+  }, []);
 
-  const reloadDetail = useCallback(async () => {
+  const selected = tasks.find((task) => task.id === selectedId);
+  const selectedUpdatedAt = selected?.updatedAt;
+
+  // One detail effect: reset on selection change, coalesce refetches triggered by list updates.
+  useEffect(() => {
     if (selectedId === null) {
+      loadedIdRef.current = null;
       setDetail(null);
       return;
     }
-    try {
-      setDetail(await fetchTask(selectedId));
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+    if (loadedIdRef.current !== selectedId) {
+      loadedIdRef.current = selectedId;
+      setDetail(null);
     }
-  }, [selectedId]);
+    const timer = setTimeout(() => {
+      void loadDetail(selectedId);
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [selectedId, selectedUpdatedAt, loadDetail]);
+
+  // Turns driven outside useChat only publish a few list snapshots, so poll the open task while it runs.
+  const running = selected?.status === "running";
+  useEffect(() => {
+    if (!running || selectedId === null) return;
+    const timer = setInterval(() => {
+      void loadDetail(selectedId);
+    }, 1_000);
+    return () => clearInterval(timer);
+  }, [running, selectedId, loadDetail]);
 
   useEffect(() => {
-    void reloadDetail();
-  }, [reloadDetail]);
+    if (!mobile) return;
+    if (!mountedRef.current) {
+      mountedRef.current = true;
+      return;
+    }
+    // preventScroll keeps the fixed drawer from being scrolled into view by focus().
+    if (drawerOpen) sidebarRef.current?.focus({ preventScroll: true });
+    else menuRef.current?.focus({ preventScroll: true });
+  }, [drawerOpen, mobile]);
 
-  const selectedUpdatedAt = selected?.updatedAt;
-  useEffect(() => {
-    if (selectedId !== null) void reloadDetail();
-  }, [selectedUpdatedAt, selectedId, reloadDetail]);
-
-  const connection = connectionOf(settings, health);
+  const connection = connectionOf(health);
   const connected = connection === "connected";
 
   const handleCreate = (input: NewTaskInput): void => {
     setShowNewTask(false);
     createTask(input)
       .then((created) => {
+        setTasks((current) => [created, ...current.filter((task) => task.id !== created.id)]);
         setSelectedId(created.id);
         setDetail(created);
-        void reloadTasks();
+        loadedIdRef.current = created.id;
       })
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
   };
 
-  const handlePermission = (decision: PermissionDecision): void => {
-    const pending = detail?.pendingPermission;
-    if (selectedId === null || pending === undefined) return;
+  const handlePermission = (
+    taskId: string,
+    permission: PendingPermission,
+    decision: PermissionDecision,
+  ): void => {
     const body =
       decision === "cancel"
-        ? { requestId: pending.requestId, decision }
-        : { requestId: pending.requestId, optionId: decision.optionId };
-    respondPermission(selectedId, body)
-      .then(() => reloadDetail())
+        ? { requestId: permission.requestId, decision }
+        : { requestId: permission.requestId, optionId: decision.optionId };
+    respondPermission(taskId, body)
+      .then(() => loadDetail(taskId))
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
   };
 
@@ -219,25 +282,34 @@ export const App = () => {
   return (
     <div className="app">
       <button
+        ref={menuRef}
         type="button"
         className="menu-button"
         aria-label="Open task list"
+        aria-expanded={drawerOpen}
+        aria-controls="task-sidebar"
         onClick={() => setDrawerOpen(true)}
       >
         ☰
       </button>
 
-      <aside className={drawerOpen ? "sidebar open" : "sidebar"} aria-label="Tasks">
+      <aside
+        id="task-sidebar"
+        ref={sidebarRef}
+        className={drawerOpen ? "sidebar open" : "sidebar"}
+        aria-label="Tasks"
+        tabIndex={-1}
+        inert={mobile && !drawerOpen}
+      >
         <div className="sidebar-header">
           <span className={`connection connection-${connection}`}>
-            {connectionLabel[connection]}
+            {CONNECTION_LABELS[connection]}
           </span>
+          {settings !== null && !settings.hasSecret ? (
+            <span className="connection-hint">No ACP secret configured</span>
+          ) : null}
           <div className="sidebar-actions">
-            <button
-              type="button"
-              onClick={() => setShowNewTask(true)}
-              disabled={connection === "not-configured"}
-            >
+            <button type="button" onClick={() => setShowNewTask(true)} disabled={!connected}>
               New task
             </button>
             <button type="button" onClick={() => setShowSettings(true)}>
@@ -272,18 +344,16 @@ export const App = () => {
       <main className="main">
         {selected === undefined ? (
           <EmptyState
-            title={connection === "not-configured" ? "ACP is not configured" : "No task selected"}
+            title={connected ? "No task selected" : "Not connected to the agent"}
             body={
-              connection === "not-configured"
-                ? "Add the agent WebSocket URL and secret in Settings."
-                : "Pick a task from the list or create a new one."
+              connected
+                ? "Pick a task from the list or create a new one."
+                : "Start grok agent serve, or check the URL and secret in Settings."
             }
             action={
-              connection === "not-configured" ? (
-                <button type="button" onClick={() => setShowSettings(true)}>
-                  Open settings
-                </button>
-              ) : undefined
+              <button type="button" onClick={() => setShowSettings(true)}>
+                Open settings
+              </button>
             }
           />
         ) : (
@@ -292,22 +362,18 @@ export const App = () => {
               task={selected}
               connected={connected}
               onCancel={() => {
-                void cancelTask(selected.id).then(() => reloadDetail());
+                void cancelTask(selected.id).then(() => loadDetail(selected.id));
               }}
               onClose={() => {
                 void closeTask(selected.id).then(() => reloadTasks());
               }}
               onRefresh={() => {
-                void reloadDetail();
+                void loadDetail(selected.id);
                 void reloadTasks();
               }}
             />
-            {detail?.pendingPermission === undefined ? null : (
-              <PermissionBanner
-                permission={detail.pendingPermission}
-                disabled={!connected}
-                onDecide={handlePermission}
-              />
+            {detail === null ? null : (
+              <PermissionPrompt detail={detail} connected={connected} onDecide={handlePermission} />
             )}
             {detail === null ? (
               <p className="empty-note">Loading task…</p>
@@ -316,7 +382,7 @@ export const App = () => {
                 key={detail.id}
                 detail={detail}
                 connected={connected}
-                onTurnFinished={reloadDetail}
+                onTurnFinished={() => loadDetail(detail.id)}
               />
             )}
           </>

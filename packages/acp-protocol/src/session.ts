@@ -37,17 +37,6 @@ export interface SessionNewResult {
   readonly configOptions: readonly SessionConfigOption[];
 }
 
-export interface SessionSummary {
-  readonly sessionId: string;
-  readonly cwd?: string;
-  readonly title?: string;
-  readonly updatedAt?: string;
-}
-
-export interface SessionListResult {
-  readonly sessions: readonly SessionSummary[];
-}
-
 export interface PromptResult {
   readonly stopReason?: string;
   readonly usage?: Usage;
@@ -239,30 +228,6 @@ export const parseSessionNewResult = (input: unknown): SessionNewResult | undefi
     models: parseModelState(record["models"]),
     configOptions: parseConfigOptions(record["configOptions"]),
   };
-};
-
-const parseSessionSummaries = (input: unknown): SessionSummary[] => {
-  const list = asArray(input);
-  if (list === undefined) return [];
-  const sessions: SessionSummary[] = [];
-  for (const item of list) {
-    const record = asRecord(item);
-    if (record === undefined) continue;
-    const sessionId = asString(record["sessionId"]);
-    if (sessionId === undefined) continue;
-    sessions.push({
-      sessionId,
-      cwd: asString(record["cwd"]),
-      title: asString(record["title"]),
-      updatedAt: asString(record["updatedAt"]),
-    });
-  }
-  return sessions;
-};
-
-export const parseSessionListResult = (input: unknown): SessionListResult => {
-  const record = asRecord(input) ?? {};
-  return { sessions: parseSessionSummaries(record["sessions"]) };
 };
 
 export const parsePromptResult = (input: unknown): PromptResult => {

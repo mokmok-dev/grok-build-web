@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   basename,
+  connectionOf,
   relativeTime,
-  statusLabel,
+  STATUS_LABELS,
   taskTitle,
   toInitialMessages,
   usageLine,
@@ -25,18 +26,35 @@ describe("relativeTime", () => {
     expect(relativeTime(0, 120_000)).toBe("2m ago");
     expect(relativeTime(0, 2 * 3_600_000)).toBe("2h ago");
     expect(relativeTime(0, 2 * 86_400_000)).toBe("2d ago");
+    expect(relativeTime(0, 60_000)).toBe("1m ago");
+    expect(relativeTime(0, 3_600_000)).toBe("1h ago");
+    expect(relativeTime(0, 86_400_000)).toBe("1d ago");
+    expect(relativeTime(0, 59_000)).toBe("59s ago");
     expect(relativeTime(10_000, 1_000)).toBe("0s ago");
   });
 });
 
 describe("labels", () => {
   it("names every status", () => {
-    expect(statusLabel("starting")).toBe("Starting");
-    expect(statusLabel("idle")).toBe("Idle");
-    expect(statusLabel("running")).toBe("Running");
-    expect(statusLabel("awaiting_permission")).toBe("Awaiting permission");
-    expect(statusLabel("error")).toBe("Error");
-    expect(statusLabel("closed")).toBe("Closed");
+    expect(STATUS_LABELS).toEqual({
+      starting: "Starting",
+      idle: "Idle",
+      running: "Running",
+      awaiting_permission: "Awaiting permission",
+      error: "Error",
+      closed: "Closed",
+    });
+  });
+
+  it("derives the connection state from health", () => {
+    expect(connectionOf(null)).toBe("disconnected");
+    expect(connectionOf({ ok: true, acp: { connected: true, url: "ws://x" } })).toBe("connected");
+    expect(connectionOf({ ok: true, acp: { connected: false, url: "ws://x" } })).toBe(
+      "disconnected",
+    );
+    expect(
+      connectionOf({ ok: true, acp: { connected: false, url: "ws://x", lastError: "lost" } }),
+    ).toBe("reconnecting");
   });
 
   it("falls back for an untitled task", () => {
@@ -63,6 +81,7 @@ describe("toInitialMessages", () => {
     updatedAt: 1,
     messageCount: messages.length,
     usage: {},
+    yolo: false,
     messages,
     plan: [],
     availableCommands: [],

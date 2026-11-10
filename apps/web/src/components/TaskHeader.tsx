@@ -19,6 +19,7 @@ export const TaskHeader = ({
     <div className="task-heading">
       <h1>{taskTitle(task)}</h1>
       <StatusBadge status={task.status} />
+      {task.yolo ? <span className="badge badge-yolo">YOLO</span> : null}
     </div>
     <p className="task-sub">
       {task.cwd} · {task.model ?? "default model"}

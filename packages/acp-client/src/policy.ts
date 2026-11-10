@@ -11,7 +11,7 @@ export const resolveCandidate = (candidate: string, cwd: string): string =>
 
 export const allowedRoots = (cwd: string, extraRoots: readonly string[]): string[] => [
   resolve(cwd),
-  ...extraRoots.map((root) => resolve(cwd, root)),
+  ...extraRoots.map((root) => resolve(root)),
 ];
 
 export const resolveAllowedPath = (

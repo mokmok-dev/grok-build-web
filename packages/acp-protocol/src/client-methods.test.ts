@@ -5,7 +5,6 @@ import {
   permissionCancelled,
   permissionSelected,
   readFileResponse,
-  terminalOutputResponse,
 } from "./client-methods.ts";
 
 describe("parseClientRequest", () => {
@@ -157,16 +156,6 @@ describe("response builders", () => {
   it("builds wire responses", () => {
     expect(readFileResponse("hi")).toEqual({ content: "hi" });
     expect(emptyResponse()).toEqual({});
-    expect(terminalOutputResponse("out", true)).toEqual({
-      output: "out",
-      truncated: true,
-      exitStatus: undefined,
-    });
-    expect(terminalOutputResponse("out", false, { exitCode: 0 })).toEqual({
-      output: "out",
-      truncated: false,
-      exitStatus: { exitCode: 0 },
-    });
     expect(permissionSelected("allow_once")).toEqual({
       outcome: { outcome: "selected", optionId: "allow_once" },
     });

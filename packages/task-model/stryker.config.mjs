@@ -1,12 +1,6 @@
+import base from "../../stryker.base.mjs";
+
 export default {
-  plugins: ["@stryker-mutator/vitest-runner"],
-  testRunner: "vitest",
-  vitest: { configFile: "vitest.config.ts" },
+  ...base,
   mutate: ["src/**/*.ts", "!src/**/*.test.ts", "!src/index.ts"],
-  thresholds: { high: 100, low: 100, break: 100 },
-  coverageAnalysis: "perTest",
-  concurrency: 2,
-  reporters: ["clear-text", "progress"],
-  tempDirName: ".stryker-tmp",
-  cleanTempDir: true,
 };

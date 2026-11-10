@@ -23,7 +23,7 @@ export const NewTaskDialog = ({
   const [cwd, setCwd] = useState(defaultCwd);
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
-  const [yolo, setYolo] = useState(true);
+  const [yolo, setYolo] = useState(false);
 
   return (
     <Dialog title="New task" onClose={onClose}>

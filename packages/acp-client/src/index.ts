@@ -8,7 +8,7 @@ export type {
   AcpStatusInfo,
   IncomingRequest,
 } from "./client.ts";
-export { allocate, emptyCorrelation, size, take, takeAll } from "./jsonrpc-client.ts";
+export { allocate, emptyCorrelation, take, takeAll } from "./jsonrpc-client.ts";
 export type { Correlation, CorrelationEntry } from "./jsonrpc-client.ts";
 export {
   allowedRoots,

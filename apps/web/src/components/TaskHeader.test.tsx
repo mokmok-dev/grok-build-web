@@ -13,6 +13,7 @@ const task = (patch: Partial<TaskSummary>): TaskSummary => ({
   updatedAt: 1,
   messageCount: 0,
   usage: {},
+  yolo: false,
   ...patch,
 });
 

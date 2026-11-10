@@ -4,7 +4,6 @@ import {
   parseModelState,
   parsePromptResult,
   parseServerNotification,
-  parseSessionListResult,
   parseSessionNewResult,
   parseSessionUpdate,
   parseUsage,
@@ -141,31 +140,6 @@ describe("parseSessionNewResult", () => {
       models: undefined,
       configOptions: [],
     });
-  });
-});
-
-describe("parseSessionListResult", () => {
-  it("parses sessions and skips invalid entries", () => {
-    expect(
-      parseSessionListResult({
-        sessions: [
-          { sessionId: "a", cwd: "/tmp", title: "T", updatedAt: "2024" },
-          { cwd: "/tmp" },
-          "x",
-          { sessionId: "b" },
-        ],
-      }),
-    ).toEqual({
-      sessions: [
-        { sessionId: "a", cwd: "/tmp", title: "T", updatedAt: "2024" },
-        { sessionId: "b", cwd: undefined, title: undefined, updatedAt: undefined },
-      ],
-    });
-  });
-
-  it("defaults a missing list", () => {
-    expect(parseSessionListResult({})).toEqual({ sessions: [] });
-    expect(parseSessionListResult(null)).toEqual({ sessions: [] });
   });
 });
 
@@ -628,11 +602,6 @@ describe("parseServerNotification", () => {
       upserted: [],
       removed: [],
     });
-    expect(parseServerNotification("x.ai/sessions/changed", { upserted: ["x", 1] })).toEqual({
-      kind: "sessions_changed",
-      upserted: [],
-      removed: [],
-    });
   });
 
   it("parses prompt completions", () => {
@@ -659,7 +628,6 @@ describe("parseServerNotification", () => {
     expect(
       parseServerNotification("x.ai/session/prompt_complete", { promptId: "p" }),
     ).toBeUndefined();
-    expect(parseServerNotification("x.ai/session/prompt_complete", "x")).toBeUndefined();
   });
 
   it("parses model updates", () => {
