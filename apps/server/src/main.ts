@@ -3,10 +3,22 @@ import { NodeHttpServer } from "@effect/platform-node";
 import { Effect, Exit, Fiber, Layer } from "effect";
 import { HttpRouter } from "effect/http";
 import { appLayer } from "./app.ts";
-import { loadConfig } from "./config.ts";
+import { loadConfig, type ServerConfig } from "./config.ts";
+
+const loadOrExit = (): ServerConfig => {
+  try {
+    return loadConfig();
+  } catch (cause) {
+    console.error(
+      "server failed to start:",
+      cause instanceof Error ? cause.message : String(cause),
+    );
+    process.exit(1);
+  }
+};
 
 const main = (): void => {
-  const config = loadConfig();
+  const config = loadOrExit();
   const server = HttpRouter.serve(appLayer(config), { disableListenLog: false }).pipe(
     Layer.provide(
       NodeHttpServer.layer(() => createServer(), { port: config.port, host: config.host }),

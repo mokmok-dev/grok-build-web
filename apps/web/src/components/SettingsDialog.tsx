@@ -1,79 +1,48 @@
-import { useState } from "react";
 import type { Settings } from "../api.ts";
 import { Dialog } from "./Dialog.tsx";
-
-export interface SettingsInput {
-  readonly url?: string;
-  readonly secret?: string;
-  readonly defaultCwd?: string;
-  readonly defaultModel?: string;
-}
 
 export const SettingsDialog = ({
   settings,
   onClose,
-  onSave,
 }: {
   readonly settings: Settings;
   readonly onClose: () => void;
-  readonly onSave: (input: SettingsInput) => void;
-}) => {
-  const [url, setUrl] = useState(settings.url);
-  const [secret, setSecret] = useState("");
-  const [defaultCwd, setDefaultCwd] = useState(settings.defaultCwd);
-  const [defaultModel, setDefaultModel] = useState(settings.defaultModel ?? "");
+}) => (
+  <Dialog title="Settings" onClose={onClose}>
+    <dl className="settings-list">
+      <dt>ACP WebSocket URL</dt>
+      <dd>{settings.url}</dd>
 
-  return (
-    <Dialog title="Settings" onClose={onClose}>
-      <form
-        className="form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          onSave({
-            url: url.trim(),
-            secret: secret === "" ? undefined : secret,
-            defaultCwd: defaultCwd.trim(),
-            defaultModel: defaultModel.trim() === "" ? undefined : defaultModel.trim(),
-          });
-        }}
-      >
-        <label htmlFor="settings-url">ACP WebSocket URL</label>
-        <input id="settings-url" value={url} onChange={(event) => setUrl(event.target.value)} />
+      <dt>Secret</dt>
+      <dd>{settings.hasSecret ? "Configured" : "Not set"}</dd>
 
-        <label htmlFor="settings-secret">Secret</label>
-        <input
-          id="settings-secret"
-          type="password"
-          value={secret}
-          placeholder={settings.hasSecret ? "stored on the server" : "not set"}
-          onChange={(event) => setSecret(event.target.value)}
-        />
+      <dt>Default working directory</dt>
+      <dd>{settings.defaultCwd}</dd>
 
-        <label htmlFor="settings-cwd">Default working directory</label>
-        <input
-          id="settings-cwd"
-          value={defaultCwd}
-          onChange={(event) => setDefaultCwd(event.target.value)}
-        />
+      <dt>Default model</dt>
+      <dd>{settings.defaultModel ?? "Not set"}</dd>
 
-        <label htmlFor="settings-model">Default model</label>
-        <input
-          id="settings-model"
-          value={defaultModel}
-          onChange={(event) => setDefaultModel(event.target.value)}
-        />
+      <dt>Read-only mode</dt>
+      <dd>{settings.readOnly ? "Enabled" : "Disabled"}</dd>
 
-        {settings.readOnly ? (
-          <p className="note">Read-only mode is enabled on the server.</p>
-        ) : null}
+      <dt>Config file</dt>
+      <dd>
+        <code>{settings.configFile}</code>
+      </dd>
+    </dl>
 
-        <div className="form-actions">
-          <button type="button" className="secondary" onClick={onClose}>
-            Cancel
-          </button>
-          <button type="submit">Save</button>
-        </div>
-      </form>
-    </Dialog>
-  );
-};
+    <p className="note">
+      {settings.configFileExists ? (
+        <>
+          Settings are read from this file at startup. Edit it on the server host and restart the
+          server to apply changes.
+        </>
+      ) : (
+        <>
+          No config file at this path; the values above come from the server environment. Create the
+          file on the server host and restart the server to configure settings.
+        </>
+      )}
+    </p>
+  </Dialog>
+);

@@ -117,6 +117,7 @@ textarea {
 .sidebar-actions {
   display: flex;
   gap: 0.5rem;
+  flex-wrap: wrap;
 }
 
 .connection {
@@ -156,6 +157,124 @@ textarea {
   flex-direction: column;
   gap: 0.4rem;
   overflow-y: auto;
+}
+
+.project-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+}
+
+.project {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 0;
+}
+
+.project-heading {
+  margin: 0;
+  font-size: inherit;
+  font-weight: inherit;
+}
+
+.project-header {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  width: 100%;
+  text-align: left;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-weight: 600;
+  padding: 0.45rem 0.6rem;
+}
+
+.project-chevron {
+  color: var(--muted);
+  width: 0.8rem;
+}
+
+.project-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-meta {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.project .task-list {
+  overflow: visible;
+}
+
+.dir-label {
+  margin: 0 0 0.35rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.dir-tree,
+.dir-children {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.dir-tree {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.35rem;
+  max-height: 16rem;
+  overflow-y: auto;
+}
+
+.dir-children {
+  padding-left: 0.9rem;
+}
+
+.dir-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.dir-toggle {
+  background: transparent;
+  color: var(--muted);
+  padding: 0.1rem 0.3rem;
+  min-width: 1.4rem;
+}
+
+.dir-name {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: transparent;
+  color: var(--text);
+  font-weight: 400;
+  padding: 0.25rem 0.4rem;
+  border-radius: var(--radius);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dir-name:hover {
+  background: var(--surface-2);
+}
+
+.dir-name.selected {
+  background: var(--surface-2);
+  color: var(--accent-strong);
+  font-weight: 600;
 }
 
 .task-item {
@@ -508,7 +627,7 @@ textarea {
 .note {
   color: var(--warn);
   font-size: 0.8rem;
-  margin: 0;
+  margin: 0.75rem 0 0;
 }
 
 .dialog-backdrop {
@@ -555,6 +674,23 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 0.45rem;
+}
+
+.settings-list {
+  display: grid;
+  grid-template-columns: minmax(9rem, auto) 1fr;
+  gap: 0.4rem 0.75rem;
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.settings-list dt {
+  color: var(--muted);
+}
+
+.settings-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .form label {

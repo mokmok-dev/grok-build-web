@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App.tsx";
@@ -125,6 +125,8 @@ const baseRoutes = (call: Call): { status?: number; body: unknown } | undefined 
           hasSecret: true,
           defaultCwd: "/tmp/work",
           readOnly: false,
+          configFile: "/tmp/grok-build-web.config.json",
+          configFileExists: true,
         },
       };
     case "/api/agent":
@@ -138,11 +140,29 @@ const baseRoutes = (call: Call): { status?: number; body: unknown } | undefined 
       };
     case "/api/tasks":
       return { body: { tasks: [summary] } };
+    case "/api/projects":
+      return { body: { projects: [] } };
     case "/api/tasks/s1":
       return { body: detail() };
     default:
       return undefined;
   }
+};
+
+const alphaProjectRoutes = (call: Call): { status?: number; body: unknown } | undefined => {
+  if (call.path === "/api/tasks" && call.method === "GET") {
+    return {
+      body: { tasks: [{ ...summary, id: "a", title: "Alpha task", cwd: "/tmp/alpha/src" }] },
+    };
+  }
+  if (call.path === "/api/projects" && call.method === "GET") {
+    return { body: { projects: [{ id: "p1", name: "Alpha", root: "/tmp/alpha" }] } };
+  }
+  if (call.path === "/api/tasks" && call.method === "POST") {
+    return { body: detail({ id: "s2", title: "Fresh", cwd: "/tmp/alpha/src" }) };
+  }
+  if (call.path === "/api/tasks/s2") return { body: detail({ id: "s2", title: "Fresh" }) };
+  return baseRoutes(call);
 };
 
 beforeEach(() => {
@@ -185,13 +205,19 @@ describe("App", () => {
       if (call.path === "/api/tasks" && call.method === "POST") {
         return { body: detail({ id: "s2", title: "Fresh", status: "running" }) };
       }
+      if (call.path === "/api/projects" && call.method === "GET") {
+        return {
+          body: {
+            projects: [{ id: "p1", name: "Sub", root: "/tmp/work/sub" }],
+          },
+        };
+      }
       return baseRoutes(call);
     });
     render(<App />);
     await screen.findByText("My task");
     await user.click(screen.getByRole("button", { name: "New task" }));
-    await user.clear(screen.getByLabelText("Working directory"));
-    await user.type(screen.getByLabelText("Working directory"), "/tmp/work/sub");
+    await user.selectOptions(screen.getByLabelText("Project"), "/tmp/work/sub");
     await user.type(screen.getByLabelText("First prompt"), "hello");
     await user.click(screen.getByRole("button", { name: "Create task" }));
     await screen.findByRole("heading", { name: "Fresh" });
@@ -203,6 +229,71 @@ describe("App", () => {
       model: undefined,
       yolo: false,
     });
+  });
+
+  it("leaves the cwd out of the body when the default working directory is chosen", async () => {
+    const user = userEvent.setup();
+    installFetch((call) => {
+      if (call.path === "/api/tasks" && call.method === "POST") {
+        return { body: detail({ id: "s2", title: "Fresh" }) };
+      }
+      if (call.path === "/api/tasks/s2") return { body: detail({ id: "s2", title: "Fresh" }) };
+      return baseRoutes(call);
+    });
+    render(<App />);
+    await screen.findByText("My task");
+    await user.click(screen.getByRole("button", { name: "New task" }));
+    await user.click(screen.getByRole("button", { name: "Create task" }));
+    await waitFor(() =>
+      expect(
+        calls.find((call) => call.method === "POST" && call.path === "/api/tasks"),
+      ).toBeTruthy(),
+    );
+    expect(
+      calls.find((call) => call.method === "POST" && call.path === "/api/tasks")?.body,
+    ).toEqual({ yolo: false });
+  });
+
+  it("expands the project that holds a task created from the dialog", async () => {
+    const user = userEvent.setup();
+    installFetch(alphaProjectRoutes);
+    render(<App />);
+    const header = await screen.findByRole("button", { name: /^Alpha,/ });
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("Alpha task")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "New task" }));
+    await user.selectOptions(screen.getByLabelText("Project"), "/tmp/alpha");
+    await user.click(screen.getByRole("button", { name: "Create task" }));
+
+    await screen.findByRole("heading", { name: "Fresh" });
+    expect(screen.getByRole("button", { name: /^Alpha,/ }).getAttribute("aria-expanded")).toBe(
+      "true",
+    );
+    expect(screen.getByText("Alpha task")).toBeTruthy();
+    expect(screen.getByText("alpha · 2 tasks")).toBeTruthy();
+  });
+
+  it("expands a manually collapsed project when a task is created in it", async () => {
+    const user = userEvent.setup();
+    installFetch(alphaProjectRoutes);
+    render(<App />);
+    const header = await screen.findByRole("button", { name: /^Alpha,/ });
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+    await user.click(header);
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+    await user.click(header);
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+
+    await user.click(screen.getByRole("button", { name: "New task" }));
+    await user.selectOptions(screen.getByLabelText("Project"), "/tmp/alpha");
+    await user.click(screen.getByRole("button", { name: "Create task" }));
+
+    await screen.findByRole("heading", { name: "Fresh" });
+    expect(screen.getByRole("button", { name: /^Alpha,/ }).getAttribute("aria-expanded")).toBe(
+      "true",
+    );
+    expect(screen.getByText("Alpha task")).toBeTruthy();
   });
 
   it("cancels a running task, refreshes and closes it", async () => {
@@ -306,33 +397,16 @@ describe("App", () => {
     expect(permission?.body).toEqual({ requestId: "r1", optionId: "allow_once" });
   });
 
-  it("saves settings", async () => {
+  it("shows the settings read-only", async () => {
     const user = userEvent.setup();
-    installFetch((call) => {
-      if (call.path === "/api/settings" && call.method === "PUT") {
-        return {
-          body: {
-            url: "ws://127.0.0.1:2419/ws",
-            hasSecret: true,
-            defaultCwd: "/tmp/work",
-            readOnly: false,
-          },
-        };
-      }
-      return baseRoutes(call);
-    });
+    installFetch(baseRoutes);
     render(<App />);
     await screen.findByText("My task");
     await user.click(screen.getByRole("button", { name: "Settings" }));
-    await user.type(await screen.findByLabelText("Secret"), "next-secret");
-    await user.click(screen.getByRole("button", { name: "Save" }));
-    const saved = calls.find((call) => call.method === "PUT" && call.path === "/api/settings");
-    expect(saved?.body).toEqual({
-      url: "ws://127.0.0.1:2419/ws",
-      secret: "next-secret",
-      defaultCwd: "/tmp/work",
-      defaultModel: undefined,
-    });
+    expect(await screen.findByRole("dialog", { name: "Settings" })).toBeTruthy();
+    expect(screen.getByText("/tmp/grok-build-web.config.json")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+    expect(calls.some((call) => call.method === "PUT")).toBe(false);
   });
 
   it("sends composer text through useChat and refetches on finish", async () => {
@@ -483,11 +557,14 @@ describe("App", () => {
     render(<App />);
     await screen.findByText("My task");
     await user.click(screen.getByRole("button", { name: "New task" }));
-    const cwd = (await screen.findByLabelText("Working directory")) as HTMLInputElement;
-    expect(cwd.value).toBe("");
-    const options = within(screen.getByLabelText("Model")).getAllByRole("option");
+    const project = (await screen.findByLabelText("Project")) as HTMLSelectElement;
+    expect(project.value).toBe("");
+    const options = within(project).getAllByRole("option");
     expect(options).toHaveLength(1);
-    expect(options[0]?.textContent).toBe("Default");
+    expect(options[0]?.textContent).toBe("Default working directory");
+    const models = within(screen.getByLabelText("Model")).getAllByRole("option");
+    expect(models).toHaveLength(1);
+    expect(models[0]?.textContent).toBe("Default");
   });
 
   it("reports a failed permission submit", async () => {
@@ -516,21 +593,6 @@ describe("App", () => {
     expect(await screen.findByText("permission rejected")).toBeTruthy();
   });
 
-  it("reports a failed settings submit", async () => {
-    const user = userEvent.setup();
-    installFetch((call) => {
-      if (call.path === "/api/settings" && call.method === "PUT") {
-        return { status: 400, body: { error: "settings rejected" } };
-      }
-      return baseRoutes(call);
-    });
-    render(<App />);
-    await screen.findByText("My task");
-    await user.click(screen.getByRole("button", { name: "Settings" }));
-    await user.click(await screen.findByRole("button", { name: "Save" }));
-    expect(await screen.findByText("settings rejected")).toBeTruthy();
-  });
-
   it("closes the new-task dialog", async () => {
     const user = userEvent.setup();
     installFetch(baseRoutes);
@@ -540,6 +602,101 @@ describe("App", () => {
     expect(await screen.findByRole("dialog", { name: "New task" })).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("dialog", { name: "New task" })).toBeNull();
+  });
+
+  it("creates a project from the picker and expands it in the sidebar", async () => {
+    const user = userEvent.setup();
+    installFetch((call) => {
+      if (call.path === "/api/projects" && call.method === "POST") {
+        return { body: { id: "p1", name: "Alpha", root: "/tmp/work/app" } };
+      }
+      if (call.path.startsWith("/api/fs/dirs")) {
+        return {
+          body: {
+            path: "/tmp/work",
+            entries: ["/tmp/work/app"],
+          },
+        };
+      }
+      return baseRoutes(call);
+    });
+    render(<App />);
+    await screen.findByText("My task");
+    const newProject = screen.getByRole("button", { name: "New project" }) as HTMLButtonElement;
+    await waitFor(() => expect(newProject.disabled).toBe(false));
+
+    await user.click(newProject);
+    expect(await screen.findByRole("dialog", { name: "New project" })).toBeTruthy();
+    await user.click(await screen.findByRole("button", { name: "app" }));
+    await user.click(screen.getByRole("button", { name: "Create project" }));
+
+    expect(
+      calls.find((call) => call.method === "POST" && call.path === "/api/projects")?.body,
+    ).toEqual({ name: undefined, root: "/tmp/work/app" });
+    const header = await screen.findByRole("button", { name: /Alpha/ });
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("app · 0 tasks")).toBeTruthy();
+  });
+
+  it("keeps the project dialog open when creation is rejected", async () => {
+    const user = userEvent.setup();
+    installFetch((call) => {
+      if (call.path === "/api/projects" && call.method === "POST") {
+        return {
+          status: 400,
+          body: { error: "A project already uses this directory: /tmp/work/app" },
+        };
+      }
+      if (call.path.startsWith("/api/fs/dirs")) {
+        return {
+          body: {
+            path: "/tmp/work",
+            entries: ["/tmp/work/app"],
+          },
+        };
+      }
+      return baseRoutes(call);
+    });
+    render(<App />);
+    await screen.findByText("My task");
+    await user.click(screen.getByRole("button", { name: "New project" }));
+    await user.click(await screen.findByRole("button", { name: "app" }));
+    await user.click(screen.getByRole("button", { name: "Create project" }));
+    expect(
+      await screen.findByText("A project already uses this directory: /tmp/work/app"),
+    ).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "New project" })).toBeTruthy();
+    expect(screen.getByText("Selected: /tmp/work/app")).toBeTruthy();
+  });
+
+  it("opens the project picker without settings", async () => {
+    const user = userEvent.setup();
+    installFetch((call) => {
+      if (call.path === "/api/settings") throw new Error("unavailable");
+      if (call.path === "/api/fs/dirs") {
+        return { body: { path: "/srv", entries: [] } };
+      }
+      return baseRoutes(call);
+    });
+    render(<App />);
+    await screen.findByText("My task");
+    const newProject = screen.getByRole("button", { name: "New project" }) as HTMLButtonElement;
+    await waitFor(() => expect(newProject.disabled).toBe(false));
+    await user.click(newProject);
+    expect(await screen.findByRole("dialog", { name: "New project" })).toBeTruthy();
+    expect(calls.some((call) => call.path === "/api/fs/dirs")).toBe(true);
+  });
+
+  it("reports a failed project list load", async () => {
+    installFetch((call) => {
+      if (call.path === "/api/projects" && call.method === "GET") {
+        return { status: 500, body: { error: "projects failed" } };
+      }
+      return baseRoutes(call);
+    });
+    render(<App />);
+    expect(await screen.findByText("projects failed")).toBeTruthy();
+    expect(await screen.findByText("My task")).toBeTruthy();
   });
 
   it("polls health on the timer", async () => {
@@ -595,11 +752,11 @@ describe("App", () => {
     await screen.findByText("My task");
     await user.click(screen.getByRole("button", { name: "Settings" }));
     expect(await screen.findByRole("dialog", { name: "Settings" })).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "Close dialog" }));
     expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
   });
 
-  it("shows an API error", async () => {
+  it("keeps the new-task dialog open with its prompt when creation is rejected", async () => {
     const user = userEvent.setup();
     installFetch((call) => {
       if (call.path === "/api/tasks" && call.method === "POST") {
@@ -610,8 +767,11 @@ describe("App", () => {
     render(<App />);
     await screen.findByText("My task");
     await user.click(screen.getByRole("button", { name: "New task" }));
+    await user.type(screen.getByLabelText("First prompt"), "keep me");
     await user.click(screen.getByRole("button", { name: "Create task" }));
     expect(await screen.findByText("Working directory is outside the allowed roots")).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "New task" })).toBeTruthy();
+    expect((screen.getByLabelText("First prompt") as HTMLTextAreaElement).value).toBe("keep me");
   });
 });
 
@@ -622,7 +782,6 @@ describe("api wrappers", () => {
     await api.cancelTask("a b");
     await api.closeTask("ab");
     await api.respondPermission("ab", { requestId: "r", decision: "cancel" });
-    await api.saveSettings({ defaultCwd: "/tmp" });
     expect(calls).toEqual([
       { method: "GET", path: "/api/tasks", body: undefined },
       { method: "POST", path: "/api/tasks/a%20b/cancel", body: {} },
@@ -632,7 +791,6 @@ describe("api wrappers", () => {
         path: "/api/tasks/ab/permission",
         body: { requestId: "r", decision: "cancel" },
       },
-      { method: "PUT", path: "/api/settings", body: { defaultCwd: "/tmp" } },
     ]);
   });
 

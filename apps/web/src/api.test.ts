@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   basename,
   connectionOf,
+  isWithinRoot,
   relativeTime,
   STATUS_LABELS,
   taskTitle,
@@ -16,6 +17,16 @@ describe("basename", () => {
     expect(basename("/tmp/work/")).toBe("work");
     expect(basename("work")).toBe("work");
     expect(basename("/")).toBe("/");
+  });
+});
+
+describe("isWithinRoot", () => {
+  it("only matches on a path-segment boundary", () => {
+    expect(isWithinRoot("/tmp/alpha", "/tmp/alpha")).toBe(true);
+    expect(isWithinRoot("/tmp/alpha/src", "/tmp/alpha")).toBe(true);
+    expect(isWithinRoot("/tmp/alpha/src", "/tmp/alpha/")).toBe(true);
+    expect(isWithinRoot("/tmp/alphabet", "/tmp/alpha")).toBe(false);
+    expect(isWithinRoot("/tmp", "/tmp/alpha")).toBe(false);
   });
 });
 

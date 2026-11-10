@@ -1,7 +1,8 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -40,13 +41,23 @@ interface RunResult {
   readonly stderr: string;
 }
 
-const spawnServer = (port: number) => {
+// Without `GROK_WEB_CONFIG` the default path resolves against the server's cwd, so a stray
+// grok-build-web.config.json beside the checkout would change these runs.
+const emptyConfigFile = join(
+  mkdtempSync(join(tmpdir(), "grok-web-main-")),
+  "grok-build-web.config.json",
+);
+writeFileSync(emptyConfigFile, "{}");
+
+const spawnServer = (port: number, env: Record<string, string> = {}) => {
   const child = spawn(process.execPath, [serverEntry], {
     env: {
       ...process.env,
       PORT: String(port),
       GROK_ACP_URL: "ws://127.0.0.1:1/ws",
       GROK_WEB_DEFAULT_CWD: tmpdir(),
+      GROK_WEB_CONFIG: emptyConfigFile,
+      ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -99,6 +110,23 @@ describe("main", () => {
     } finally {
       stop(child);
       blocker.close();
+    }
+  }, 60_000);
+
+  it("exits 1 on an invalid config file", async () => {
+    ensureBuild();
+    const root = mkdtempSync(join(tmpdir(), "grok-web-config-"));
+    const configFile = join(root, "grok-build-web.config.json");
+    writeFileSync(configFile, JSON.stringify({ acpUrl: "http://nope" }));
+    const { child, exited } = spawnServer(await freePort(), { GROK_WEB_CONFIG: configFile });
+    try {
+      const result = await exited;
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("server failed to start");
+      expect(result.stderr).toContain(configFile);
+      expect(result.stderr).toContain("acpUrl");
+    } finally {
+      stop(child);
     }
   }, 60_000);
 

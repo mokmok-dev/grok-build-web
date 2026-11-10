@@ -172,7 +172,7 @@ const run = async (): Promise<void> => {
     console.log("connection status: Connected");
 
     await page.getByRole("button", { name: "New task" }).click();
-    await page.getByLabel("Working directory").fill("/tmp");
+    await page.getByLabel("Project").selectOption({ label: "Default working directory" });
     await page.getByLabel("First prompt").fill("Reply with the single word: pong");
     await page.getByRole("button", { name: "Create task" }).click();
 

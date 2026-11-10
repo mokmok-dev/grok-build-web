@@ -3,8 +3,9 @@ import { AcpClient, layer as acpClientLayer } from "@grok-build-web/acp-client";
 import { Effect, Layer } from "effect";
 import { HttpRouter } from "effect/http";
 import { routes, startRequestHandler } from "./api.ts";
-import { settingsLayer, type ServerConfig } from "./config.ts";
+import type { ServerConfig } from "./config.ts";
 import { fsBridgeLayer } from "./fs-bridge.ts";
+import { projectRegistryLayer } from "./projects.ts";
 import { taskRegistryLayer } from "./tasks.ts";
 import { terminalRegistryLayer } from "./terminal.ts";
 
@@ -17,6 +18,7 @@ export const appLayer = (
   );
   const core = Layer.mergeAll(
     acp,
+    projectRegistryLayer({ maxProjects: config.maxProjects }),
     fsBridgeLayer({
       allowedRoots: config.allowedRoots,
       readOnly: config.readOnly,
@@ -27,7 +29,6 @@ export const appLayer = (
       maxTerminals: config.maxTerminals,
       outputByteLimit: config.terminalOutputLimit,
     }),
-    Layer.provide(settingsLayer(config), acp),
     Layer.provide(
       taskRegistryLayer({
         maxTasks: config.maxTasks,

@@ -7,41 +7,49 @@ const settings = {
   url: "ws://127.0.0.1:2419/ws",
   hasSecret: true,
   defaultCwd: "/work",
+  roots: ["/work"],
   defaultModel: "m1",
   readOnly: false,
+  configFile: "/etc/grok-build-web.config.json",
+  configFileExists: true,
 };
 
 describe("SettingsDialog", () => {
-  it("submits changed settings", async () => {
-    const user = userEvent.setup();
-    const onSave = vi.fn();
-    render(<SettingsDialog settings={settings} onClose={() => undefined} onSave={onSave} />);
-    expect((screen.getByLabelText("ACP WebSocket URL") as HTMLInputElement).value).toBe(
-      settings.url,
-    );
-    expect(screen.getByPlaceholderText("stored on the server")).toBeTruthy();
-    await user.type(screen.getByLabelText("Secret"), "new-secret");
-    await user.clear(screen.getByLabelText("Default model"));
-    await user.click(screen.getByRole("button", { name: "Save" }));
-    expect(onSave).toHaveBeenCalledWith({
-      url: settings.url,
-      secret: "new-secret",
-      defaultCwd: "/work",
-      defaultModel: undefined,
-    });
+  it("shows the resolved configuration without an edit path", () => {
+    render(<SettingsDialog settings={settings} onClose={() => undefined} />);
+    expect(screen.getByText(settings.url)).toBeTruthy();
+    expect(screen.getByText("Configured")).toBeTruthy();
+    expect(screen.getByText("/work")).toBeTruthy();
+    expect(screen.getByText("m1")).toBeTruthy();
+    expect(screen.getByText("Disabled")).toBeTruthy();
+    expect(screen.getByText(settings.configFile)).toBeTruthy();
+    expect(screen.getByText(/read from this file/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+    expect(screen.queryByRole("textbox")).toBeNull();
   });
 
-  it("notes read-only mode and closes", async () => {
+  it("points at the environment when no file exists", () => {
+    render(
+      <SettingsDialog
+        settings={{ ...settings, configFileExists: false }}
+        onClose={() => undefined}
+      />,
+    );
+    expect(screen.getByText(/No config file at this path/)).toBeTruthy();
+    expect(screen.getByText(/come from the server environment/)).toBeTruthy();
+  });
+
+  it("notes unset values and read-only mode, then closes", async () => {
     const user = userEvent.setup();
     const onClose = vi.fn();
     render(
       <SettingsDialog
-        settings={{ ...settings, readOnly: true }}
+        settings={{ ...settings, hasSecret: false, defaultModel: undefined, readOnly: true }}
         onClose={onClose}
-        onSave={() => undefined}
       />,
     );
-    expect(screen.getByText(/Read-only mode/)).toBeTruthy();
+    expect(screen.getAllByText("Not set")).toHaveLength(2);
+    expect(screen.getByText("Enabled")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: /Close dialog/ }));
     expect(onClose).toHaveBeenCalled();
   });
