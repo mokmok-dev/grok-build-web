@@ -157,6 +157,15 @@ describe("mergeUsage", () => {
       reasoningTokens: undefined,
     });
   });
+
+  it("keeps base counters the patch omits", () => {
+    expect(mergeUsage({ reasoningTokens: 5, outputTokens: 6 }, {})).toEqual({
+      inputTokens: undefined,
+      outputTokens: 6,
+      totalTokens: undefined,
+      reasoningTokens: 5,
+    });
+  });
 });
 
 describe("text chunks", () => {
@@ -204,6 +213,27 @@ describe("text chunks", () => {
     );
     expect(third.messages.map((message) => message.id)).toEqual(["m1", "m2"]);
     expect(lastMessage(third).parts).toEqual([{ type: "text", text: "c" }]);
+  });
+
+  it("updates only the addressed message", () => {
+    const existing = task({
+      messages: [
+        assistant([{ type: "text", text: "a" }], "m1"),
+        assistant([{ type: "text", text: "b" }], "m2"),
+      ],
+    });
+    const next = update(
+      {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "!" },
+        messageId: "m1",
+      },
+      existing,
+    );
+    expect(next.messages).toEqual([
+      assistant([{ type: "text", text: "a!" }], "m1"),
+      assistant([{ type: "text", text: "b" }], "m2"),
+    ]);
   });
 
   it("opens a new assistant message after a user message", () => {
@@ -314,6 +344,16 @@ describe("tool calls", () => {
     });
   });
 
+  it("returns a pending existing tool to pending", () => {
+    const existing = task({ messages: [textTool({ status: "completed" })] });
+    const next = update(
+      { sessionUpdate: "tool_call", toolCallId: "t1", title: "", status: "pending" },
+      existing,
+    );
+    const part = lastMessage(next).parts[0];
+    expect(part?.type === "tool" ? part.tool.status : undefined).toBe("pending");
+  });
+
   it("defaults a bare tool call", () => {
     const next = update({ sessionUpdate: "tool_call", toolCallId: "t1", title: "" });
     const part = lastMessage(next).parts[0];
@@ -351,13 +391,103 @@ describe("tool calls", () => {
   });
 
   it("keeps existing fields on a sparse tool update", () => {
-    const existing = task({ messages: [textTool({ title: "Old", output: { old: true } })] });
+    const existing = task({
+      messages: [
+        textTool({ title: "Old", output: { old: true }, status: "completed", arguments: "abc" }),
+      ],
+    });
     const next = update({ sessionUpdate: "tool_call_update", toolCallId: "t1" }, existing);
     const part = lastMessage(next).parts[0];
     expect(part?.type === "tool" ? part.tool : undefined).toMatchObject({
       title: "Old",
       output: { old: true },
+      status: "completed",
+      arguments: "abc",
+    });
+  });
+
+  it("creates an empty stub when a tool update has no fields", () => {
+    const next = update({ sessionUpdate: "tool_call_update", toolCallId: "tx" });
+    const part = lastMessage(next).parts[0];
+    expect(part?.type === "tool" ? part.tool : undefined).toMatchObject({
+      name: "",
+      title: "",
+      output: undefined,
+      arguments: "",
       status: "pending",
+    });
+  });
+
+  it("leaves other parts and tools untouched", () => {
+    const existing: Task = task({
+      messages: [
+        {
+          id: "a1",
+          role: "assistant",
+          createdAt: 1,
+          parts: [
+            { type: "text", text: "keep" },
+            {
+              type: "tool",
+              tool: {
+                toolCallId: "t1",
+                name: "shell",
+                title: "One",
+                status: "pending",
+                arguments: "",
+              },
+            },
+            {
+              type: "tool",
+              tool: {
+                toolCallId: "t2",
+                name: "bash",
+                title: "Two",
+                status: "pending",
+                arguments: "",
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const next = update(
+      { sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed" },
+      existing,
+    );
+    const parts = lastMessage(next).parts;
+    expect(parts[0]).toEqual({ type: "text", text: "keep" });
+    expect(parts[1]?.type === "tool" ? parts[1].tool.status : undefined).toBe("completed");
+    expect(parts[2]?.type === "tool" ? parts[2].tool : undefined).toMatchObject({
+      toolCallId: "t2",
+      title: "Two",
+    });
+  });
+
+  it("appends a tool to a message without tools", () => {
+    const existing = task({ messages: [assistant([{ type: "text", text: "hi" }])] });
+    const next = update(
+      { sessionUpdate: "tool_call", toolCallId: "t1", title: "Run", name: "shell" },
+      existing,
+    );
+    const parts = lastMessage(next).parts;
+    expect(parts).toHaveLength(2);
+    expect(parts[0]).toEqual({ type: "text", text: "hi" });
+    expect(parts[1]?.type === "tool" ? parts[1].tool.toolCallId : undefined).toBe("t1");
+  });
+
+  it("appends a new tool beside a different one", () => {
+    const existing = task({ messages: [textTool({ toolCallId: "t2", title: "Two" })] });
+    const next = update(
+      { sessionUpdate: "tool_call", toolCallId: "t1", title: "One", name: "shell" },
+      existing,
+    );
+    const parts = lastMessage(next).parts;
+    expect(parts).toHaveLength(2);
+    expect(parts[0]?.type === "tool" ? parts[0].tool.toolCallId : undefined).toBe("t2");
+    expect(parts[1]?.type === "tool" ? parts[1].tool : undefined).toMatchObject({
+      toolCallId: "t1",
+      title: "One",
     });
   });
 
@@ -417,13 +547,17 @@ describe("other session updates", () => {
 
 describe("x.ai session notifications", () => {
   it("completes a turn", () => {
-    const next = notification({
-      kind: "session_notification",
-      sessionId: "s1",
-      update: { sessionUpdate: "turn_completed", usage: { totalTokens: 4 } },
-    });
+    const next = notification(
+      {
+        kind: "session_notification",
+        sessionId: "s1",
+        update: { sessionUpdate: "turn_completed", usage: { totalTokens: 4 } },
+      },
+      task({ status: "running" }),
+    );
     expect(next.status).toBe("idle");
     expect(next.usage).toEqual({ totalTokens: 4 });
+    expect(next.updatedAt).toBe(10);
   });
 
   it("merges response usage and ignores an empty one", () => {
@@ -474,6 +608,20 @@ describe("x.ai session notifications", () => {
     );
     const secondPart = lastMessage(second).parts[0];
     expect(secondPart?.type === "tool" ? secondPart.tool.arguments : undefined).toBe("{}");
+  });
+
+  it("creates a bare tool for a nameless delta", () => {
+    const next = notification({
+      kind: "session_notification",
+      sessionId: "s1",
+      update: { sessionUpdate: "tool_call_delta_chunk", toolCallId: "tx" },
+    });
+    const part = lastMessage(next).parts[0];
+    expect(part?.type === "tool" ? part.tool : undefined).toMatchObject({
+      name: "",
+      title: "",
+      arguments: "",
+    });
   });
 
   it("awaits a permission interaction", () => {
@@ -582,15 +730,19 @@ describe("applySessionChange", () => {
   });
 
   it("applies idle activity without touching absent fields", () => {
-    const next = applySessionChange(task(), { sessionId: "s1", activity: "idle" }, 10);
+    const next = applySessionChange(
+      task({ status: "running" }),
+      { sessionId: "s1", activity: "idle" },
+      10,
+    );
     expect(next).toMatchObject({ title: "T", model: "m", status: "idle" });
   });
 
   it("keeps the status for an unknown activity", () => {
     expect(
-      applySessionChange(task({ status: "running" }), { sessionId: "s1", activity: "other" }, 10)
+      applySessionChange(task({ status: "idle" }), { sessionId: "s1", activity: "other" }, 10)
         .status,
-    ).toBe("running");
+    ).toBe("idle");
   });
 });
 
